@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - name: Validate Python
+        run: python3 -m py_compile scripts/manage.py templates/agent_helpers.py tests/test_manage.py
+      - name: Run tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Validate wrapper syntax
+        run: zsh -n templates/browser-use-isolated.zsh
+      - name: Check privacy and portability
+        run: python3 scripts/check_repo.py
