@@ -1,0 +1,6 @@
+interface:
+  display_name: "Browser Use Isolated"
+  short_description: "Install and maintain isolated Browser Use on macOS"
+  default_prompt: "Use $browser-use-isolated to install, diagnose, or upgrade my isolated Browser Use environment."
+policy:
+  allow_implicit_invocation: true
