@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -123,6 +124,45 @@ class ManageTests(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("FAIL wrapper", result.stdout)
+
+    def test_upstream_upgrade_uses_existing_uv_tool_environment(self):
+        uv_browser_use = (
+            self.home
+            / ".local/share/uv/tools/browser-use/bin/browser-use"
+        )
+        uv_browser_use.parent.mkdir(parents=True)
+        uv_browser_use.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        self.browser_use.unlink()
+        self.browser_use.symlink_to(uv_browser_use)
+        args = manage.parser().parse_args(
+            self.command("update", "--upstream")[2:]
+        )
+        layout = manage.Layout(args)
+
+        with mock.patch.object(
+            manage.shutil,
+            "which",
+            return_value="/opt/homebrew/bin/uv",
+        ):
+            self.assertEqual(
+                manage.upstream_upgrade_command(layout),
+                [
+                    "/opt/homebrew/bin/uv",
+                    "tool",
+                    "upgrade",
+                    "browser-use",
+                ],
+            )
+
+    def test_upstream_upgrade_keeps_official_fallback_for_other_installs(self):
+        args = manage.parser().parse_args(
+            self.command("update", "--upstream")[2:]
+        )
+        layout = manage.Layout(args)
+        self.assertEqual(
+            manage.upstream_upgrade_command(layout),
+            [str(self.browser_use), "--update", "-y"],
+        )
 
 
 if __name__ == "__main__":

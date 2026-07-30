@@ -491,15 +491,46 @@ def doctor(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def upstream_upgrade_command(layout: Layout) -> list[str]:
+    resolved = layout.browser_use_bin.resolve(strict=False)
+    uv_tool_root = (
+        layout.home / ".local/share/uv/tools/browser-use"
+    ).resolve(strict=False)
+    try:
+        resolved.relative_to(uv_tool_root)
+    except ValueError:
+        return [str(layout.browser_use_bin), "--update", "-y"]
+
+    uv = shutil.which("uv")
+    if uv is None:
+        raise RuntimeError(
+            "browser-use is managed by uv, but the uv command is unavailable"
+        )
+    return [uv, "tool", "upgrade", "browser-use"]
+
+
+def upgrade_upstream(layout: Layout) -> int:
+    command = upstream_upgrade_command(layout)
+    result = run(command, check=False)
+    print(result.stdout, end="")
+    print(result.stderr, end="", file=sys.stderr)
+    if result.returncode:
+        return result.returncode
+    skill_result = run(
+        [str(layout.browser_use_bin), "skill", "install"],
+        check=False,
+    )
+    print(skill_result.stdout, end="")
+    print(skill_result.stderr, end="", file=sys.stderr)
+    return skill_result.returncode
+
+
 def update(args: argparse.Namespace) -> int:
     layout = Layout(args)
     if args.upstream:
-        result = run([str(layout.browser_use_bin), "--update", "-y"], check=False)
-        print(result.stdout, end="")
-        print(result.stderr, end="", file=sys.stderr)
-        if result.returncode:
-            return result.returncode
-        run([str(layout.browser_use_bin), "skill", "install"], check=True)
+        result = upgrade_upstream(layout)
+        if result:
+            return result
     return install(args)
 
 
