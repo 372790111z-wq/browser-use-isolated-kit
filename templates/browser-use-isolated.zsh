@@ -8,6 +8,8 @@ readonly PROFILE_DIR="@@PROFILE_DIR@@"
 readonly AGENT_WORKSPACE="@@AGENT_WORKSPACE@@"
 readonly POOL_STATE="$AGENT_WORKSPACE/tab-pool/state.json"
 readonly POOL_SIZE=@@POOL_SIZE@@
+readonly HARD_LIMIT=$((POOL_SIZE * 2))
+readonly INITIAL_TABS=1
 readonly CDP_PORT=@@CDP_PORT@@
 readonly CDP_URL="http://127.0.0.1:$CDP_PORT"
 
@@ -144,7 +146,7 @@ reusable = [
     or (t.get("url") or "").startswith("chrome://new-tab-page")
     or (t.get("url") or "").startswith("data:text/html,BU_POOL_")
 ]
-for slot in range(1, ${POOL_SIZE} + 1):
+for slot in range(1, ${INITIAL_TABS} + 1):
     url = f"about:blank#codex-pool-{slot:02d}"
     target_id = by_url.get(url)
     needs_navigation = False
@@ -209,14 +211,12 @@ if cdp_is_ours; then
   marker_count_before="$(pool_marker_count)"
   if [[ "$saved_generation_before" != "$current_generation" \
       || "${saved_pool_size_before:-0}" -ne "$POOL_SIZE" ]]; then
-    if [[ "$marker_count_before" -lt "$POOL_SIZE" ]]; then
+    if [[ "$marker_count_before" -lt "$INITIAL_TABS" ]]; then
       real_page_count="$(non_disposable_page_count)"
       if [[ "$real_page_count" -eq 0 ]]; then
         terminate_isolated_chrome
       else
-        print -u2 "browser-use-isolated: tab pool needs rebuilding, but $real_page_count real page(s) are open"
-        print -u2 "preserving those pages; restart the isolated Chrome when they are no longer needed"
-        exit 1
+        print -u2 "browser-use-isolated: preserving and adopting $real_page_count restored page(s)"
       fi
     fi
   fi
@@ -231,7 +231,7 @@ if ! cdp_is_ours; then
   started_chrome=1
   typeset -a pool_urls
   typeset slot
-  for (( slot=1; slot<=POOL_SIZE; slot++ )); do
+  for (( slot=1; slot<=INITIAL_TABS; slot++ )); do
     pool_urls+=("data:text/html,BU_POOL_$(printf '%02d' "$slot")")
   done
   /usr/bin/open -g -na "$CHROME_APP" --args \
@@ -272,25 +272,18 @@ saved_generation="$(state_generation)"
 saved_pool_size="$(state_pool_size)"
 marker_count="$(pool_marker_count)"
 if [[ ("$saved_generation" != "$generation" || "${saved_pool_size:-0}" -ne "$POOL_SIZE") \
-    && "$marker_count" -lt "$POOL_SIZE" ]]; then
+    && "$marker_count" -lt "$INITIAL_TABS" ]]; then
   typeset final_real_page_count
   final_real_page_count="$(non_disposable_page_count)"
   if [[ "$final_real_page_count" -eq 0 ]]; then
     if ! bootstrap_pool; then
-      print -u2 "browser-use-isolated: failed to label the preallocated $POOL_SIZE-tab pool"
+      print -u2 "browser-use-isolated: failed to initialize the first managed tab"
       exit 1
     fi
     marker_count="$(pool_marker_count)"
   else
-    print -u2 "browser-use-isolated: expected $POOL_SIZE pool tabs, found $marker_count while preserving $final_real_page_count real page(s)"
-    exit 1
+    print -u2 "browser-use-isolated: preserving and adopting $final_real_page_count restored page(s)"
   fi
-fi
-
-if [[ "$marker_count" -lt "$POOL_SIZE" \
-    && ("$saved_generation" != "$generation" || "${saved_pool_size:-0}" -ne "$POOL_SIZE") ]]; then
-  print -u2 "browser-use-isolated: expected $POOL_SIZE pool tabs, found $marker_count"
-  exit 1
 fi
 
 export BU_NAME="$DAEMON_NAME"
@@ -298,6 +291,7 @@ export BU_CDP_URL="$CDP_URL"
 export BH_AGENT_WORKSPACE="$AGENT_WORKSPACE"
 export BU_BROWSER_GENERATION="$generation"
 export BU_TAB_POOL_SIZE="$POOL_SIZE"
+export BU_TAB_POOL_HARD_LIMIT="$HARD_LIMIT"
 export BROWSER_USE_BACKGROUND_TABS=1
 
 # Each Codex thread keeps its daemon between invocations so helpers such as

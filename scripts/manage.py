@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -62,6 +63,12 @@ class Layout:
             or "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
         ).expanduser()
         self.chrome_app = args.chrome_app
+        inferred_app = self.chrome_bin.parent.parent.parent
+        self.chrome_app_path = (
+            inferred_app
+            if inferred_app.suffix == ".app"
+            else Path(self.chrome_app).expanduser()
+        )
         self.profile_dir = self.home / ".browser-use/profiles/codex-isolated"
         self.workspace = (
             self.home / ".config/browser-harness/agent-workspace-isolated"
@@ -84,11 +91,15 @@ class Layout:
                 )
             except (json.JSONDecodeError, OSError):
                 saved_config = {}
-        self.port = (
-            args.port
-            if args.port is not None
-            else int(saved_config.get("cdp_port") or 9333)
-        )
+        saved_port = saved_config.get("cdp_port")
+        if args.port is not None:
+            self.port = args.port
+        elif saved_port:
+            self.port = int(saved_port)
+        elif args.command == "install":
+            self.port = first_available_port()
+        else:
+            self.port = 9333
         self.pool_size = args.pool_size
         self.site_packages = (
             Path(args.site_packages).expanduser()
@@ -113,6 +124,18 @@ class Layout:
         return None
 
 
+def first_available_port(start: int = 9333, stop: int = 9399) -> int:
+    """Choose once at first install; persisted config prevents launch-time drift."""
+    for port in range(start, stop + 1):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            try:
+                probe.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+        return port
+    raise RuntimeError(f"No free local CDP port in {start}-{stop}")
+
+
 def policy_block(layout: Layout) -> str:
     return f"""{POLICY_START}
 ## Device-local isolated browser policy
@@ -123,6 +146,10 @@ For local browser work on this Mac, always invoke `browser-use-isolated`.
 - Dedicated profile: `{layout.profile_dir}`
 - Dedicated CDP: `http://127.0.0.1:{layout.port}`
 - Per-thread daemon: `codex-isolated-$CODEX_THREAD_ID`
+- Tabs are created on demand. The configured pool size is a soft threshold;
+  twice that value is the default safety limit.
+- All sessions may list isolated tabs. A completed, idle, or abandoned tab may
+  be taken over; an actively leased tab must never be stolen.
 - Never auto-discover or fall back to the user's everyday Chrome.
 - The isolation boundary is the installed Google Chrome application plus a
   separate profile, process, CDP endpoint, and observable tab pool. A second
@@ -134,7 +161,7 @@ problems. If isolation cannot be restored safely, stop and report the blocker.
 Shared Chrome requires an explicit user request.
 
 Use `new_tab(url)` for the first page. At normal completion call
-`complete_thread_tabs()` so results remain visible and reclaimable. Use
+`complete_thread_tabs()` so results remain visible and safely reclaimable. Use
 `show_tab()` only when the user explicitly asks to see the controlled page.
 {POLICY_END}"""
 
@@ -327,7 +354,7 @@ def render_wrapper(layout: Layout) -> str:
     )
     values = {
         "@@BROWSER_USE_BIN@@": str(layout.browser_use_bin),
-        "@@CHROME_APP@@": layout.chrome_app,
+        "@@CHROME_APP@@": str(layout.chrome_app_path),
         "@@CHROME_BIN@@": str(layout.chrome_bin),
         "@@PROFILE_DIR@@": str(layout.profile_dir),
         "@@AGENT_WORKSPACE@@": str(layout.workspace),

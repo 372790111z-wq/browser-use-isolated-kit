@@ -1,6 +1,6 @@
 ---
 name: browser-use-isolated
-description: "Install, diagnose, upgrade, or remove the macOS Browser Use isolated environment with a dedicated Chrome profile, CDP endpoint, per-Codex-thread daemon, observable 12-tab pool, background-focus protection, and no fallback to everyday Chrome. Use when setting up Browser Use on a new Mac, repairing isolated startup, syncing this kit across machines, or upgrading Browser Use without losing local isolation patches."
+description: "Install, diagnose, upgrade, or remove the macOS Browser Use isolated environment with a dedicated Chrome profile, persisted CDP endpoint, per-Codex-thread leases, shared on-demand tabs, background-focus protection, and no fallback to everyday Chrome. Use when setting up Browser Use on a new Mac, repairing isolated startup, syncing this kit across machines, or upgrading Browser Use without losing local isolation patches."
 ---
 
 # Browser Use Isolated
@@ -53,6 +53,10 @@ long prompt.
 - Do not claim success until the wrapper, Skill policy, helper, package
   patches, and doctor checks pass.
 - `uninstall` requires `--yes` and preserves the Chrome profile.
+- Never steal a live tab lease. Cross-session takeover is allowed only for an
+  idle, completed, or abandoned tab.
+- Do not hardcode a CDP port in prompts. The installer chooses it once and the
+  wrapper exposes the persisted endpoint to every supported IDE.
 
 Read `references/architecture.md` when explaining the isolation boundary or
 debugging an upgrade.

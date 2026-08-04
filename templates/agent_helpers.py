@@ -1,4 +1,4 @@
-"""Observable per-Codex-thread tab pool for the local isolated Chrome."""
+"""Shared, leased tab workspace for the local isolated Chrome."""
 
 from contextlib import contextmanager
 import fcntl
@@ -22,6 +22,7 @@ _BASE_GOTO_URL = _h.goto_url
 _THREAD_ID = os.environ.get("CODEX_THREAD_ID") or "shared"
 _GENERATION = os.environ.get("BU_BROWSER_GENERATION") or "unknown"
 _POOL_SIZE = int(os.environ.get("BU_TAB_POOL_SIZE") or "12")
+_HARD_LIMIT = int(os.environ.get("BU_TAB_POOL_HARD_LIMIT") or str(_POOL_SIZE * 2))
 _WORKSPACE = Path(os.environ.get("BH_AGENT_WORKSPACE") or ".")
 _STATE_DIR = _WORKSPACE / "tab-pool"
 _STATE_PATH = _STATE_DIR / "state.json"
@@ -31,11 +32,13 @@ _POOL_URL_RE = re.compile(r"^about:blank#codex-pool-(\d+)$")
 
 def _new_state():
     return {
-        "version": 3,
+        "version": 4,
         "generation": _GENERATION,
         "pool_size": _POOL_SIZE,
+        "hard_limit": _HARD_LIMIT,
         "slots": {},
         "assignments": {},
+        "archive": [],
         "updated_at": time.time(),
     }
 
@@ -47,12 +50,14 @@ def _read_state():
         return _new_state()
     if state.get("generation") != _GENERATION:
         return _new_state()
-    if state.get("version") == 2:
-        state["version"] = 3
+    if state.get("version") in (2, 3):
+        state["version"] = 4
+        state["hard_limit"] = _HARD_LIMIT
+        state.setdefault("archive", [])
         for assignment in state.get("assignments", {}).values():
             assignment.setdefault("completed_slots", {})
         return state
-    if state.get("version") != 3:
+    if state.get("version") != 4:
         return _new_state()
     return state
 
@@ -114,8 +119,22 @@ def _refresh_pool(state):
         if not match:
             continue
         slot = int(match.group(1))
-        if 1 <= slot <= _POOL_SIZE:
+        if 1 <= slot <= _HARD_LIMIT:
             slots[str(slot)] = target_id
+
+    # After a Chrome restart target ids change and restored real pages no longer
+    # carry pool-marker URLs. Adopt every unmatched page into the shared
+    # isolated workspace instead of losing it or silently navigating it away.
+    tracked = set(slots.values())
+    free_slots = [
+        value for value in range(1, _HARD_LIMIT + 1) if str(value) not in slots
+    ]
+    for target_id in sorted(targets):
+        if target_id in tracked or not free_slots:
+            continue
+        slot = free_slots.pop(0)
+        slots[str(slot)] = target_id
+        tracked.add(target_id)
 
     assignments = state.setdefault("assignments", {})
     for thread_id, assignment in list(assignments.items()):
@@ -180,6 +199,43 @@ def _stop_thread_daemon(thread_id):
     return False
 
 
+def _thread_is_active(thread_id):
+    if thread_id == _THREAD_ID:
+        return True
+    return _ipc.ping(f"codex-isolated-{thread_id}", timeout=0.15)
+
+
+def _archive_target(state, targets, thread_id, slot, reason):
+    target_id = state["slots"].get(str(slot))
+    tab = targets.get(target_id, {})
+    state.setdefault("archive", []).append(
+        {
+            "target_id": target_id,
+            "slot": int(slot),
+            "owner_thread": thread_id,
+            "title": tab.get("title", ""),
+            "url": tab.get("url", ""),
+            "reason": reason,
+            "archived_at": time.time(),
+        }
+    )
+    state["archive"] = state["archive"][-200:]
+
+
+def _create_target(state):
+    used = {int(slot) for slot in state["slots"]}
+    slot = next((value for value in range(1, _HARD_LIMIT + 1) if value not in used), None)
+    if slot is None:
+        return None, None
+    marker = f"about:blank#codex-pool-{slot:02d}"
+    result = _h.cdp("Target.createTarget", url=marker, background=True)
+    target_id = result.get("targetId")
+    if not target_id:
+        raise RuntimeError("Chrome did not create a background Browser Use tab")
+    state["slots"][str(slot)] = target_id
+    return str(slot), target_id
+
+
 def _remove_assignment_slot(assignments, thread_id, slot):
     assignment = assignments.get(thread_id)
     if not assignment:
@@ -214,14 +270,35 @@ def _claim_new_target():
         ]
         reclaimed_from = None
 
+        if not available and len(slots) < _POOL_SIZE:
+            slot, target_id = _create_target(state)
+            if slot and target_id:
+                targets[target_id] = {
+                    "targetId": target_id,
+                    "target_id": target_id,
+                    "title": "",
+                    "url": f"about:blank#codex-pool-{int(slot):02d}",
+                }
+                available = [slot]
+
         if not available:
             candidates = []
             for thread_id, assignment in assignments.items():
-                if thread_id != _THREAD_ID and not _fully_completed(assignment):
+                active = _thread_is_active(thread_id)
+                if not _fully_completed(assignment) and active:
                     continue
-                for raw_slot, completed_at in assignment.get(
-                    "completed_slots", {}
-                ).items():
+                completed_slots = assignment.get("completed_slots", {})
+                candidate_slots = (
+                    completed_slots.items()
+                    if active
+                    else (
+                        (str(slot), completed_slots.get(
+                            str(slot), assignment.get("last_used_at", 0)
+                        ))
+                        for slot in assignment.get("slots", [])
+                    )
+                )
+                for raw_slot, completed_at in candidate_slots:
                     slot = int(raw_slot)
                     target_id = slots.get(str(slot))
                     if target_id in targets:
@@ -229,18 +306,33 @@ def _claim_new_target():
             candidates.sort()
 
             for _, thread_id, slot in candidates:
-                if not _stop_thread_daemon(thread_id):
+                if _thread_is_active(thread_id) and not _stop_thread_daemon(thread_id):
                     continue
+                _archive_target(state, targets, thread_id, slot, "capacity")
                 reclaimed_from = thread_id
                 _remove_assignment_slot(assignments, thread_id, slot)
                 available = [str(slot)]
                 break
 
+        # If no safely reclaimable completed/abandoned lease exists, grow past
+        # the soft threshold instead of interrupting the user. The hard limit
+        # remains a resource safety boundary.
+        if not available and len(slots) < _HARD_LIMIT:
+            slot, target_id = _create_target(state)
+            if slot and target_id:
+                targets[target_id] = {
+                    "targetId": target_id,
+                    "target_id": target_id,
+                    "title": "",
+                    "url": f"about:blank#codex-pool-{int(slot):02d}",
+                }
+                available = [slot]
+
         if not available:
             raise RuntimeError(
-                f"Browser Use tab pool is full ({_POOL_SIZE}/{_POOL_SIZE}) and "
-                "all reclaimable tabs are still running or connected. "
-                "Complete a thread, close a tab, or use Browser Use Cloud."
+                f"Browser Use reached its safety limit ({_HARD_LIMIT}) and all "
+                "tabs still have active leases. The task must wait for a lease "
+                "to finish; active pages were preserved."
             )
 
         slot = available[0]
@@ -353,9 +445,46 @@ def _owned_snapshot(state, targets):
     return assignment, owned
 
 
+def _target_owner(state, target_id):
+    for thread_id, assignment in state["assignments"].items():
+        for slot in assignment.get("slots", []):
+            if state["slots"].get(str(slot)) == target_id:
+                return thread_id, assignment, int(slot)
+    return None, None, None
+
+
+def _claim_existing_target(state, targets, target_id):
+    owner, assignment, slot = _target_owner(state, target_id)
+    if owner is None:
+        slot = next(
+            (int(raw) for raw, value in state["slots"].items() if value == target_id),
+            None,
+        )
+    elif owner != _THREAD_ID:
+        completed = str(slot) in assignment.get("completed_slots", {})
+        if not completed and _thread_is_active(owner):
+            raise RuntimeError(
+                f"Tab is actively leased by Codex thread {owner}; wait for it to "
+                "finish instead of taking over a live page"
+            )
+        _remove_assignment_slot(state["assignments"], owner, slot)
+    if slot is None or target_id not in targets:
+        raise RuntimeError("The requested isolated-browser tab no longer exists")
+    current = state["assignments"].setdefault(
+        _THREAD_ID,
+        {"slots": [], "current_slot": slot, "completed_slots": {},
+         "claimed_at": time.time(), "last_used_at": time.time()},
+    )
+    current["slots"] = sorted(set(current.get("slots", []) + [slot]))
+    current["current_slot"] = slot
+    current.setdefault("completed_slots", {}).pop(str(slot), None)
+    current["last_used_at"] = time.time()
+    return current, target_id, slot
+
+
 def _resolve_requested_target(state, targets, target=None):
     assignment, owned = _owned_snapshot(state, targets)
-    if not assignment:
+    if not assignment and target is None:
         raise RuntimeError("This Codex thread does not own any Browser Use tabs")
     requested = (
         target.get("targetId") or target.get("target_id")
@@ -365,7 +494,8 @@ def _resolve_requested_target(state, targets, target=None):
     if requested is None:
         requested = state["slots"].get(str(assignment["current_slot"]))
     if requested not in owned:
-        raise RuntimeError("Cannot use a tab owned by another Codex thread")
+        assignment, requested, slot = _claim_existing_target(state, targets, requested)
+        return assignment, {requested: slot}, requested, slot
     return assignment, owned, requested, owned[requested]
 
 
@@ -382,7 +512,7 @@ def _mark_slot_running(target=None):
 
 
 def switch_tab(target):
-    """Resume and switch among tabs owned by the current Codex thread."""
+    """Switch to a tab, safely taking over only a completed or abandoned lease."""
     target_id, slot = _mark_slot_running(target)
     return _attach_target(target_id, slot, "running")
 
@@ -402,7 +532,7 @@ def goto_url(url):
 
 
 def new_tab(url="about:blank"):
-    """Claim an idle tab, or reclaim the oldest safely completed tab if full."""
+    """Create tabs on demand; archive completed work only at the hard limit."""
     claim = _claim_new_target()
     target_id = claim["target_id"]
     slot = claim["slot"]
@@ -501,32 +631,51 @@ def close_tab(target=None):
 
 
 def thread_tabs():
-    """List this thread's tabs with running/completed observability state."""
+    """List all isolated tabs; ownership is a lease, not a visibility boundary."""
     with _locked_state() as state:
         targets = _refresh_pool(state)
-        assignment = state["assignments"].get(_THREAD_ID)
-        if not assignment:
-            return []
-        completed = assignment.get("completed_slots", {})
         out = []
-        for slot in assignment["slots"]:
-            target_id = state["slots"].get(str(slot))
+        ordered_slots = sorted(
+            state["slots"].items(), key=lambda item: int(item[0])
+        )
+        for raw_slot, target_id in ordered_slots:
             if target_id not in targets:
                 continue
+            slot = int(raw_slot)
+            owner, assignment, _ = _target_owner(state, target_id)
+            completed = (assignment or {}).get("completed_slots", {})
             tab = dict(targets[target_id])
-            tab["slot"] = int(slot)
-            tab["current"] = int(slot) == int(assignment["current_slot"])
-            tab["status"] = "completed" if str(slot) in completed else "running"
+            tab["slot"] = slot
+            tab["owner_thread"] = owner
+            tab["current"] = bool(
+                owner == _THREAD_ID
+                and slot == int(assignment["current_slot"])
+            )
+            tab["status"] = (
+                "idle"
+                if owner is None
+                else ("completed" if str(slot) in completed else "running")
+            )
+            tab["claimable"] = (
+                owner is None
+                or str(slot) in completed
+                or not _thread_is_active(owner)
+            )
             tab["completed_at"] = completed.get(str(slot))
             out.append(tab)
         return out
+
+
+def list_tabs():
+    """Compatibility alias for the shared isolated-tab inventory."""
+    return thread_tabs()
 
 
 def close_thread_tabs():
     """Explicitly erase and release every tab owned by this thread."""
     released = 0
     while True:
-        tabs = thread_tabs()
+        tabs = [tab for tab in thread_tabs() if tab.get("owner_thread") == _THREAD_ID]
         if not tabs:
             return released
         close_tab(tabs[-1])
@@ -572,13 +721,16 @@ def tab_pool_status():
             if thread_id == _THREAD_ID or _fully_completed(item):
                 reclaimable += len(item.get("completed_slots", {}))
         return {
-            "pool_size": _POOL_SIZE,
+            "soft_limit": _POOL_SIZE,
+            "hard_limit": _HARD_LIMIT,
+            "pool_size": len(state["slots"]),
             "claimed": claimed,
             "idle": len(state["slots"]) - claimed,
             "running": claimed - completed,
             "completed": completed,
             "reclaimable": reclaimable,
             "effective_available": len(state["slots"]) - claimed + reclaimable,
+            "can_grow": len(state["slots"]) < _HARD_LIMIT,
             "thread_id": _THREAD_ID,
             "thread_slots": assignment.get("slots", []) if assignment else [],
             "thread_completed_slots": sorted(
