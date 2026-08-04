@@ -24,7 +24,9 @@ class ManageTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.home = self.root / "home"
         self.site = self.root / "site-packages"
-        self.chrome = self.root / "Google Chrome"
+        self.chrome = (
+            self.root / "Google Chrome.app/Contents/MacOS/Google Chrome"
+        )
         self.browser_use = self.home / ".local/bin/browser-use"
         self.skill = self.home / ".codex/skills/browser-use/SKILL.md"
         self.port = 59433
@@ -32,6 +34,7 @@ class ManageTests(unittest.TestCase):
         self.browser_use.parent.mkdir(parents=True)
         self.browser_use.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         self.browser_use.chmod(0o755)
+        self.chrome.parent.mkdir(parents=True)
         self.chrome.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         self.chrome.chmod(0o755)
         self.skill.parent.mkdir(parents=True)
@@ -163,6 +166,39 @@ class ManageTests(unittest.TestCase):
             manage.upstream_upgrade_command(layout),
             [str(self.browser_use), "--update", "-y"],
         )
+
+    def test_first_install_selects_and_then_persists_port(self):
+        args = manage.parser().parse_args(self.command("install")[2:])
+        args.port = None
+        with mock.patch.object(manage, "first_available_port", return_value=9341):
+            first = manage.Layout(args)
+        self.assertEqual(first.port, 9341)
+        first.config_dir.mkdir(parents=True)
+        first.config_path.write_text('{"cdp_port": 9341}\n', encoding="utf-8")
+        with mock.patch.object(manage, "first_available_port", return_value=9350):
+            second = manage.Layout(args)
+        self.assertEqual(second.port, 9341)
+
+    def test_generated_runtime_uses_dynamic_shared_leases(self):
+        result = subprocess.run(self.command("install"), text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        wrapper = (self.home / ".local/bin/browser-use-isolated").read_text(encoding="utf-8")
+        helper = (
+            self.home
+            / ".config/browser-harness/agent-workspace-isolated/agent_helpers.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("readonly INITIAL_TABS=1", wrapper)
+        self.assertIn(f'readonly CHROME_APP="{self.chrome.parent.parent.parent}"', wrapper)
+        self.assertIn("BU_TAB_POOL_HARD_LIMIT", wrapper)
+        self.assertIn('def list_tabs():', helper)
+        self.assertIn('Target.createTarget', helper)
+        self.assertIn('actively leased by Codex thread', helper)
+        syntax = subprocess.run(
+            ["/bin/zsh", "-n", str(self.home / ".local/bin/browser-use-isolated")],
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
 
 
 if __name__ == "__main__":

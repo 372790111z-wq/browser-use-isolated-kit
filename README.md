@@ -7,7 +7,8 @@ The kit installs:
 
 - a dedicated Chrome profile and CDP endpoint;
 - a background-safe `browser-use-isolated` wrapper;
-- a per-Codex-thread observable 12-tab pool;
+- an observable shared tab workspace with per-task leases;
+- on-demand tabs, a configurable soft threshold, and safe automatic archival;
 - deterministic Browser Use compatibility patches;
 - an idempotent policy block in the installed Browser Use Skill;
 - install, update, doctor, and safe uninstall commands.
@@ -64,6 +65,16 @@ print(page_info())
 complete_thread_tabs()
 PY
 ```
+
+The first installation selects an unused local CDP port (starting at `9333`)
+and persists it. Later launches never silently change ports. Opening more
+ordinary Chrome windows does not affect this configuration.
+
+The default soft threshold is 12 tabs and the default safety limit is 24.
+Tabs are created only when needed. At capacity, only completed or abandoned
+leases may be archived and reused; an actively leased page is preserved. All
+sessions can list the isolated workspace, while `switch_tab()` takes over only
+a completed, idle, or abandoned lease.
 
 ## Remove managed files
 
