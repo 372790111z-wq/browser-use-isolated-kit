@@ -1,6 +1,6 @@
 ---
 name: browser-use-isolated
-description: "Install, diagnose, upgrade, or remove the macOS Browser Use isolated environment with a dedicated Chrome profile, persisted CDP endpoint, per-Codex-thread leases, shared on-demand tabs, background-focus protection, and no fallback to everyday Chrome. Use when setting up Browser Use on a new Mac, repairing isolated startup, syncing this kit across machines, or upgrading Browser Use without losing local isolation patches."
+description: "Install, diagnose, upgrade, or remove the macOS Browser Use isolated environment and its Codex MCP entrypoint, with a dedicated Chrome profile, persisted CDP endpoint, shared on-demand tabs, background-focus protection, and no fallback to everyday Chrome. Use when setting up Browser Use on a new Mac, repairing isolated startup, syncing this kit across machines, configuring all Codex sessions to use the same isolated Chrome, or upgrading Browser Use without losing local isolation patches."
 ---
 
 # Browser Use Isolated
@@ -44,6 +44,27 @@ long prompt.
    python3 scripts/manage.py doctor --live
    ```
 
+7. To make the isolated browser available through host-managed MCP instead of
+   each task shell, configure the pinned official Chrome DevTools MCP:
+
+   ```bash
+   python3 scripts/manage.py configure-mcp
+   python3 scripts/manage.py doctor --mcp
+   ```
+
+   Existing Codex sessions must be restarted before the new tools appear.
+
+8. Manage future MCP releases through the kit, never `@latest`:
+
+   ```bash
+   python3 scripts/manage.py check-mcp-update
+   python3 scripts/manage.py update-mcp
+   python3 scripts/manage.py rollback-mcp --yes
+   ```
+
+   `check-mcp-update` is read-only. `update-mcp` stages and validates the new
+   executable before swapping it in and preserves one rollback copy.
+
 ## Safety
 
 - Never copy, inspect, publish, or remove the dedicated Chrome profile.
@@ -57,6 +78,11 @@ long prompt.
   idle, completed, or abandoned tab.
 - Do not hardcode a CDP port in prompts. The installer chooses it once and the
   wrapper exposes the persisted endpoint to every supported IDE.
+- Normal browser tasks use the `browser-use-isolated` MCP server. Direct CLI
+  access is maintenance or an explicitly approved compatibility fallback.
+- Pin the official Chrome DevTools MCP version; never configure `@latest`.
+- MCP connection success does not prove concurrent lease isolation. Create a
+  new background page per independent task and test multi-session behavior.
 
 Read `references/architecture.md` when explaining the isolation boundary or
 debugging an upgrade.

@@ -26,6 +26,14 @@ The repository maintains four layers:
 4. A marked policy block in the official Browser Use Skill forces local tasks
    through the isolated wrapper and forbids silent fallback.
 
+An optional fifth layer registers the pinned official Chrome DevTools MCP as a
+separate Codex server named `browser-use-isolated`. Its wrapper starts the
+dedicated Chrome when necessary and connects the MCP to the persisted CDP URL.
+This avoids model-generated task shells needing process-inspection or localhost
+permissions. It does not replace Browser Use's lease manager: independent MCP
+tasks create new background pages, and cross-session continuation remains an
+explicit routing decision.
+
 An upstream Browser Use upgrade can replace layers 3 and 4. The `update
 --upstream` command upgrades first and then reapplies all managed layers. If an
 expected source anchor changed, the installer stops instead of guessing.

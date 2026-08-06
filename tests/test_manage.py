@@ -200,6 +200,119 @@ class ManageTests(unittest.TestCase):
         )
         self.assertEqual(syntax.returncode, 0, syntax.stderr)
 
+    def test_mcp_wrapper_is_pinned_and_targets_persisted_cdp(self):
+        installed = subprocess.run(
+            self.command("install"), text=True, capture_output=True
+        )
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        args = manage.parser().parse_args(
+            self.command(
+                "configure-mcp",
+                "--npm-bin",
+                "/fake/npm",
+                "--codex-bin",
+                "/fake/codex",
+            )[2:]
+        )
+        layout = manage.Layout(args)
+        configured = False
+
+        def fake_run(command, **kwargs):
+            nonlocal configured
+            if command[:2] == ["/fake/npm", "install"]:
+                layout.mcp_bin.parent.mkdir(parents=True)
+                layout.mcp_bin.write_text(
+                    "#!/bin/sh\n"
+                    "if [ \"$1\" = \"--version\" ]; then echo 1.6.0; "
+                    "else echo browserUrl usageStatistics; fi\n",
+                    encoding="utf-8",
+                )
+                layout.mcp_bin.chmod(0o755)
+                return subprocess.CompletedProcess(command, 0, "", "")
+            if command[:4] == ["/fake/codex", "mcp", "get", manage.MCP_NAME]:
+                if configured:
+                    return subprocess.CompletedProcess(
+                        command, 0, f"command: {layout.mcp_wrapper}\n", ""
+                    )
+                return subprocess.CompletedProcess(command, 1, "", "missing")
+            if command[:4] == ["/fake/codex", "mcp", "add", manage.MCP_NAME]:
+                configured = True
+                return subprocess.CompletedProcess(command, 0, "", "")
+            if command == [str(layout.mcp_bin), "--version"]:
+                return subprocess.CompletedProcess(command, 0, "1.6.0\n", "")
+            if command == [str(layout.mcp_bin), "--help"]:
+                return subprocess.CompletedProcess(
+                    command, 0, "browserUrl usageStatistics\n", ""
+                )
+            self.fail(f"unexpected command: {command}")
+
+        with mock.patch.object(manage, "run", side_effect=fake_run):
+            self.assertEqual(manage.configure_mcp(args), 0)
+
+        wrapper = layout.mcp_wrapper.read_text(encoding="utf-8")
+        self.assertIn(f'readonly CDP_URL="http://127.0.0.1:{self.port}"', wrapper)
+        self.assertIn('"--browser-url=$CDP_URL"', wrapper)
+        self.assertIn(str(layout.mcp_bin), wrapper)
+        self.assertNotIn("@latest", wrapper)
+        self.assertEqual(manage.MCP_VERSION, "1.6.0")
+        syntax = subprocess.run(
+            ["/bin/zsh", "-n", str(layout.mcp_wrapper)],
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+
+    def test_mcp_update_stages_persists_and_rolls_back(self):
+        update_args = manage.parser().parse_args(
+            self.command(
+                "update-mcp", "--npm-bin", "/fake/npm", "--to", "1.7.0"
+            )[2:]
+        )
+        layout = manage.Layout(update_args)
+
+        def write_fake_binary(root, version):
+            binary = root / "node_modules/.bin/chrome-devtools-mcp"
+            binary.parent.mkdir(parents=True, exist_ok=True)
+            binary.write_text(
+                "#!/bin/sh\n"
+                f"if [ \"$1\" = \"--version\" ]; then echo {version}; "
+                "else echo browserUrl usageStatistics; fi\n",
+                encoding="utf-8",
+            )
+            binary.chmod(0o755)
+
+        write_fake_binary(layout.mcp_root, "1.6.0")
+        layout.config_dir.mkdir(parents=True)
+        layout.config_path.write_text(
+            '{"cdp_port": 59433, "mcp_version": "1.6.0"}\n',
+            encoding="utf-8",
+        )
+
+        def fake_run(command, **kwargs):
+            if command[:2] == ["/fake/npm", "install"]:
+                prefix = Path(command[command.index("--prefix") + 1])
+                version = command[-1].rsplit("@", 1)[-1]
+                write_fake_binary(prefix, version)
+                return subprocess.CompletedProcess(command, 0, "", "")
+            return subprocess.run(command, text=True, capture_output=True)
+
+        with mock.patch.object(manage, "run", side_effect=fake_run):
+            self.assertEqual(manage.update_mcp(update_args), 0)
+        updated_config = json.loads(layout.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(updated_config["mcp_version"], "1.7.0")
+        self.assertEqual(manage.mcp_binary_version(layout.mcp_bin), "1.7.0")
+        self.assertTrue(layout.mcp_root.with_name("mcp.previous").exists())
+
+        rollback_args = manage.parser().parse_args(
+            self.command("rollback-mcp", "--yes")[2:]
+        )
+        self.assertEqual(manage.rollback_mcp(rollback_args), 0)
+        rolled_back_config = json.loads(
+            layout.config_path.read_text(encoding="utf-8")
+        )
+        self.assertEqual(rolled_back_config["mcp_version"], "1.6.0")
+        self.assertEqual(manage.mcp_binary_version(layout.mcp_bin), "1.6.0")
+
 
 if __name__ == "__main__":
     unittest.main()
