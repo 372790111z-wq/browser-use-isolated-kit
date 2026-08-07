@@ -82,6 +82,7 @@ class Layout:
         self.backup_dir = self.config_dir / "backups"
         self.wrapper = self.home / ".local/bin/browser-use-isolated"
         self.mcp_wrapper = self.home / ".local/bin/browser-use-isolated-mcp"
+        self.mcp_guard = self.config_dir / "mcp-stdio-guard.py"
         self.mcp_root = self.home / ".local/share/browser-use-isolated-kit/mcp"
         self.mcp_bin = self.mcp_root / "node_modules/.bin/chrome-devtools-mcp"
         self.skill_file = Path(
@@ -389,6 +390,7 @@ def render_mcp_wrapper(layout: Layout) -> str:
     values = {
         "@@BROWSER_WRAPPER@@": str(layout.wrapper),
         "@@MCP_BIN@@": str(layout.mcp_bin),
+        "@@MCP_GUARD@@": str(layout.mcp_guard),
         "@@CDP_PORT@@": str(layout.port),
         "@@LOG_DIR@@": str(layout.config_dir / "logs"),
     }
@@ -397,6 +399,12 @@ def render_mcp_wrapper(layout: Layout) -> str:
     if "@@" in template:
         raise RuntimeError("Unresolved MCP wrapper template token")
     return template
+
+
+def render_mcp_guard() -> str:
+    return (REPO_ROOT / "templates/mcp-stdio-guard.py").read_text(
+        encoding="utf-8"
+    )
 
 
 def configured_mcp(layout: Layout, codex_bin: str) -> tuple[bool, str]:
@@ -480,6 +488,7 @@ def configure_mcp(args: argparse.Namespace) -> int:
     )
     validate_mcp_install(layout.mcp_root, layout.mcp_version)
     persist_mcp_version(layout, layout.mcp_version)
+    write_atomic(layout.mcp_guard, render_mcp_guard(), 0o755)
     write_atomic(layout.mcp_wrapper, render_mcp_wrapper(layout), 0o755)
 
     if existing.returncode != 0:
@@ -600,6 +609,8 @@ def remove_mcp(args: argparse.Namespace) -> int:
         run([codex_bin, "mcp", "remove", MCP_NAME])
     if layout.mcp_wrapper.exists():
         layout.mcp_wrapper.unlink()
+    if layout.mcp_guard.exists():
+        layout.mcp_guard.unlink()
     if layout.mcp_root.exists():
         shutil.rmtree(layout.mcp_root)
     print(f"Removed Codex MCP {MCP_NAME}; isolated Chrome profile preserved")
@@ -658,6 +669,15 @@ def install(args: argparse.Namespace) -> int:
     layout.profile_dir.mkdir(parents=True, exist_ok=True)
     (layout.workspace / "tab-pool").mkdir(parents=True, exist_ok=True)
     write_atomic(layout.wrapper, render_wrapper(layout), 0o755)
+    # A kit-only update must refresh the managed focus guard without requiring
+    # an npm reinstall or changing the device's pinned MCP version.
+    if layout.mcp_wrapper.exists():
+        if not layout.mcp_bin.exists():
+            raise RuntimeError(
+                "Managed MCP wrapper exists but its pinned package is missing"
+            )
+        write_atomic(layout.mcp_guard, render_mcp_guard(), 0o755)
+        write_atomic(layout.mcp_wrapper, render_mcp_wrapper(layout), 0o755)
     shutil.copy2(
         REPO_ROOT / "templates/agent_helpers.py",
         layout.workspace / "agent_helpers.py",
@@ -735,6 +755,7 @@ def doctor(args: argparse.Namespace) -> int:
         checks.extend(
             [
                 ("mcp_wrapper", layout.mcp_wrapper.exists(), str(layout.mcp_wrapper)),
+                ("mcp_guard", layout.mcp_guard.exists(), str(layout.mcp_guard)),
                 ("mcp_package", layout.mcp_bin.exists(), str(layout.mcp_bin)),
                 ("codex_mcp", mcp_ok, mcp_detail),
             ]

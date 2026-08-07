@@ -3,6 +3,7 @@ set -euo pipefail
 
 readonly BROWSER_WRAPPER="@@BROWSER_WRAPPER@@"
 readonly MCP_BIN="@@MCP_BIN@@"
+readonly MCP_GUARD="@@MCP_GUARD@@"
 readonly CDP_URL="http://127.0.0.1:@@CDP_PORT@@"
 readonly LOG_DIR="@@LOG_DIR@@"
 readonly LOG_FILE="$LOG_DIR/mcp-bootstrap.log"
@@ -24,6 +25,6 @@ if ! /usr/bin/curl -fsS --max-time 2 "$CDP_URL/json/version" >/dev/null 2>&1; th
   exit 1
 fi
 
-exec "$MCP_BIN" \
+exec /usr/bin/python3 "$MCP_GUARD" "$MCP_BIN" \
   "--browser-url=$CDP_URL" \
   --no-usage-statistics

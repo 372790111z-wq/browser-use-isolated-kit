@@ -125,6 +125,11 @@ restore_frontmost_pid() {
     "$pid" >/dev/null 2>&1 || true
 }
 
+# Capture focus before LaunchServices has any chance to activate the isolated
+# Chrome. A cold start restores this application after Chrome and its one
+# required bootstrap target are ready.
+readonly ORIGINAL_FRONTMOST_PID="$(frontmost_pid)"
+
 bootstrap_pool() {
   typeset previous_front_pid result_code=0
   previous_front_pid="$(frontmost_pid)"
@@ -284,6 +289,10 @@ if [[ ("$saved_generation" != "$generation" || "${saved_pool_size:-0}" -ne "$POO
   else
     print -u2 "browser-use-isolated: preserving and adopting $final_real_page_count restored page(s)"
   fi
+fi
+
+if [[ "$started_chrome" -eq 1 ]]; then
+  restore_frontmost_pid "$ORIGINAL_FRONTMOST_PID"
 fi
 
 export BU_NAME="$DAEMON_NAME"

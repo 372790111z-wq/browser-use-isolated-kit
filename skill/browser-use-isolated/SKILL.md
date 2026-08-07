@@ -83,6 +83,9 @@ long prompt.
 - Pin the official Chrome DevTools MCP version; never configure `@latest`.
 - MCP connection success does not prove concurrent lease isolation. Create a
   new background page per independent task and test multi-session behavior.
+- The MCP guard forces `new_page` into the background and prevents
+  `select_page` from bringing Chrome forward. Only an explicit user request to
+  show the browser may use the gated Browser Use `show_tab()` helper.
 
 Read `references/architecture.md` when explaining the isolation boundary or
 debugging an upgrade.

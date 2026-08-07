@@ -188,6 +188,8 @@ class ManageTests(unittest.TestCase):
             / ".config/browser-harness/agent-workspace-isolated/agent_helpers.py"
         ).read_text(encoding="utf-8")
         self.assertIn("readonly INITIAL_TABS=1", wrapper)
+        self.assertIn('readonly ORIGINAL_FRONTMOST_PID="$(frontmost_pid)"', wrapper)
+        self.assertIn('restore_frontmost_pid "$ORIGINAL_FRONTMOST_PID"', wrapper)
         self.assertIn(f'readonly CHROME_APP="{self.chrome.parent.parent.parent}"', wrapper)
         self.assertIn("BU_TAB_POOL_HARD_LIMIT", wrapper)
         self.assertIn('def list_tabs():', helper)
@@ -250,9 +252,13 @@ class ManageTests(unittest.TestCase):
             self.assertEqual(manage.configure_mcp(args), 0)
 
         wrapper = layout.mcp_wrapper.read_text(encoding="utf-8")
+        guard = layout.mcp_guard.read_text(encoding="utf-8")
         self.assertIn(f'readonly CDP_URL="http://127.0.0.1:{self.port}"', wrapper)
         self.assertIn('"--browser-url=$CDP_URL"', wrapper)
         self.assertIn(str(layout.mcp_bin), wrapper)
+        self.assertIn(str(layout.mcp_guard), wrapper)
+        self.assertIn('arguments["background"] = True', guard)
+        self.assertIn('arguments["bringToFront"] = False', guard)
         self.assertNotIn("@latest", wrapper)
         self.assertEqual(manage.MCP_VERSION, "1.6.0")
         syntax = subprocess.run(
@@ -261,6 +267,50 @@ class ManageTests(unittest.TestCase):
             capture_output=True,
         )
         self.assertEqual(syntax.returncode, 0, syntax.stderr)
+
+        spec = importlib.util.spec_from_file_location("mcp_guard", layout.mcp_guard)
+        guard_module = importlib.util.module_from_spec(spec)
+        assert spec.loader
+        spec.loader.exec_module(guard_module)
+        new_page = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "new_page",
+                "arguments": {
+                    "url": "https://example.com",
+                    "background": False,
+                    "isolatedContext": "unsafe",
+                },
+            },
+        }
+        protected = json.loads(
+            guard_module.protect_request(
+                (json.dumps(new_page) + "\n").encode()
+            )
+        )
+        arguments = protected["params"]["arguments"]
+        self.assertIs(arguments["background"], True)
+        self.assertNotIn("isolatedContext", arguments)
+
+        select_page = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "select_page",
+                "arguments": {"pageId": 1, "bringToFront": True},
+            },
+        }
+        protected_select = json.loads(
+            guard_module.protect_request(
+                (json.dumps(select_page) + "\n").encode()
+            )
+        )
+        self.assertIs(
+            protected_select["params"]["arguments"]["bringToFront"], False
+        )
 
     def test_mcp_update_stages_persists_and_rolls_back(self):
         update_args = manage.parser().parse_args(

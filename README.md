@@ -88,6 +88,9 @@ Browser Use helper's per-thread leases. The installed policy therefore creates
 a new background page for each independent task and continues an existing page
 only when explicitly requested. Concurrent-session behavior must be validated
 after configuration rather than inferred from successful connection alone.
+The managed stdio guard overrides Chrome DevTools MCP's foreground defaults:
+new pages always open in the background, page selection never activates the
+Chrome window, and foreground display remains an explicit Browser Use action.
 
 To roll back only the MCP entry while preserving Browser Use and the Chrome
 profile:
