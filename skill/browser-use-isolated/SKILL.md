@@ -86,6 +86,10 @@ long prompt.
 - The MCP guard forces `new_page` into the background and prevents
   `select_page` from bringing Chrome forward. Only an explicit user request to
   show the browser may use the gated Browser Use `show_tab()` helper.
+- Merely loading the MCP must not launch Chrome. Lazy-start the dedicated
+  browser under the shared host lock only for the first actual browser tool
+  call. Launch the Chrome executable directly; do not use LaunchServices
+  `open -na`, which can misroute ordinary links into the isolated instance.
 
 Read `references/architecture.md` when explaining the isolation boundary or
 debugging an upgrade.

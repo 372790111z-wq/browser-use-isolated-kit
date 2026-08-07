@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -191,6 +192,10 @@ class ManageTests(unittest.TestCase):
         self.assertIn('readonly ORIGINAL_FRONTMOST_PID="$(frontmost_pid)"', wrapper)
         self.assertIn('restore_frontmost_pid "$ORIGINAL_FRONTMOST_PID"', wrapper)
         self.assertIn(f'readonly CHROME_APP="{self.chrome.parent.parent.parent}"', wrapper)
+        self.assertNotIn('/usr/bin/open -g -na', wrapper)
+        self.assertNotIn('console.log(', wrapper)
+        self.assertIn('"$CHROME_BIN" \\', wrapper)
+        self.assertNotIn('--new-window', wrapper)
         self.assertIn("BU_TAB_POOL_HARD_LIMIT", wrapper)
         self.assertIn('def list_tabs():', helper)
         self.assertIn('Target.createTarget', helper)
@@ -257,6 +262,9 @@ class ManageTests(unittest.TestCase):
         self.assertIn('"--browser-url=$CDP_URL"', wrapper)
         self.assertIn(str(layout.mcp_bin), wrapper)
         self.assertIn(str(layout.mcp_guard), wrapper)
+        self.assertIn('BROWSER_USE_ISOLATED_WRAPPER', wrapper)
+        self.assertIn('BROWSER_USE_ISOLATED_PROFILE_DIR', wrapper)
+        self.assertNotIn('CODEX_THREAD_ID=mcp-bootstrap', wrapper)
         self.assertIn('arguments["background"] = True', guard)
         self.assertIn('arguments["bringToFront"] = False', guard)
         self.assertNotIn("@latest", wrapper)
@@ -293,6 +301,44 @@ class ManageTests(unittest.TestCase):
         arguments = protected["params"]["arguments"]
         self.assertIs(arguments["background"], True)
         self.assertNotIn("isolatedContext", arguments)
+        initialize = {
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {},
+        }
+        self.assertFalse(
+            guard_module.request_needs_browser(
+                (json.dumps(initialize) + "\n").encode()
+            )
+        )
+        self.assertTrue(
+            guard_module.request_needs_browser(
+                (json.dumps(new_page) + "\n").encode()
+            )
+        )
+        source = io.BytesIO(
+            (json.dumps(initialize) + "\n" + json.dumps(new_page) + "\n").encode()
+        )
+        destination = io.BytesIO()
+        with mock.patch.object(
+            guard_module, "ensure_browser"
+        ) as ensure_browser, mock.patch.object(
+            guard_module, "remember_focus"
+        ) as remember_focus:
+            guard_module.relay(source, destination, protect=True)
+        ensure_browser.assert_called_once_with()
+        remember_focus.assert_called_once()
+
+        response = (json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}) + "\n").encode()
+        with mock.patch.object(
+            guard_module, "frontmost_pid", return_value=123
+        ), mock.patch.object(
+            guard_module, "restore_focus_if_isolated"
+        ) as restore, mock.patch.object(guard_module.time, "sleep"):
+            guard_module.remember_focus((json.dumps(new_page) + "\n").encode())
+            guard_module.restore_focus_for_response(response)
+        restore.assert_called_once_with(123)
 
         select_page = {
             "jsonrpc": "2.0",

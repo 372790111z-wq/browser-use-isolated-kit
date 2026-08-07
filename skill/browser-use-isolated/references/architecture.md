@@ -40,6 +40,11 @@ Its stdio guard forces page creation and selection to remain in the background,
 even when an Agent omits the upstream optional flags or requests foreground
 defaults. Visual foreground activation remains an explicit user-controlled
 Browser Use action.
+The guard also defers Chrome startup until the first `tools/call`. A file lock
+prevents concurrent MCP sessions from racing to launch the same Profile and
+port. On macOS the wrapper executes the Chrome binary directly with the custom
+user-data-dir instead of asking LaunchServices to create another
+`com.google.Chrome` application instance through `open -na`.
 
 An upstream Browser Use upgrade can replace layers 3 and 4. The `update
 --upstream` command upgrades first and then reapplies all managed layers. If an

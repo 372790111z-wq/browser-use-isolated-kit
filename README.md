@@ -91,6 +91,9 @@ after configuration rather than inferred from successful connection alone.
 The managed stdio guard overrides Chrome DevTools MCP's foreground defaults:
 new pages always open in the background, page selection never activates the
 Chrome window, and foreground display remains an explicit Browser Use action.
+Loading the MCP server does not start Chrome. The guard starts it under a host
+lock immediately before the first browser tool call, so ordinary Codex tasks
+do not leave a second Chrome instance registered for URL handling.
 
 To roll back only the MCP entry while preserving Browser Use and the Chrome
 profile:

@@ -392,6 +392,7 @@ def render_mcp_wrapper(layout: Layout) -> str:
         "@@MCP_BIN@@": str(layout.mcp_bin),
         "@@MCP_GUARD@@": str(layout.mcp_guard),
         "@@CDP_PORT@@": str(layout.port),
+        "@@PROFILE_DIR@@": str(layout.profile_dir),
         "@@LOG_DIR@@": str(layout.config_dir / "logs"),
     }
     for token, value in values.items():

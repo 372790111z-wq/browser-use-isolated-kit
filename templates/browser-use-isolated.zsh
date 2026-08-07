@@ -111,7 +111,7 @@ terminate_isolated_chrome() {
 
 frontmost_pid() {
   /usr/bin/osascript -l JavaScript \
-    -e 'ObjC.import("AppKit"); console.log(ObjC.unwrap($.NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier))' \
+    -e 'ObjC.import("AppKit"); function run() { return String(ObjC.unwrap($.NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier)); }' \
     2>/dev/null || true
 }
 
@@ -239,7 +239,10 @@ if ! cdp_is_ours; then
   for (( slot=1; slot<=INITIAL_TABS; slot++ )); do
     pool_urls+=("data:text/html,BU_POOL_$(printf '%02d' "$slot")")
   done
-  /usr/bin/open -g -na "$CHROME_APP" --args \
+  # Launch the executable directly, as recommended by Chromium for a custom
+  # user-data-dir. Going through `open -na` registers another same-bundle
+  # LaunchServices instance and can misroute ordinary links into automation.
+  "$CHROME_BIN" \
     --user-data-dir="$PROFILE_DIR" \
     --remote-debugging-port="$CDP_PORT" \
     --disable-background-timer-throttling \
@@ -247,8 +250,8 @@ if ! cdp_is_ours; then
     --disable-renderer-backgrounding \
     --no-first-run \
     --no-default-browser-check \
-    --new-window \
-    "${pool_urls[@]}"
+    "${pool_urls[@]}" \
+    >"$AGENT_WORKSPACE/tab-pool/chrome.log" 2>&1 &!
 
   for attempt in {1..50}; do
     if cdp_is_ours \

@@ -5,25 +5,18 @@ readonly BROWSER_WRAPPER="@@BROWSER_WRAPPER@@"
 readonly MCP_BIN="@@MCP_BIN@@"
 readonly MCP_GUARD="@@MCP_GUARD@@"
 readonly CDP_URL="http://127.0.0.1:@@CDP_PORT@@"
+readonly PROFILE_DIR="@@PROFILE_DIR@@"
 readonly LOG_DIR="@@LOG_DIR@@"
 readonly LOG_FILE="$LOG_DIR/mcp-bootstrap.log"
 
 /bin/mkdir -p "$LOG_DIR"
 
-# Codex launches this through its MCP host instead of a model-generated task
-# shell. Start the dedicated browser only when its persisted CDP endpoint is
-# not already responding.
-if ! /usr/bin/curl -fsS --max-time 1 "$CDP_URL/json/version" >/dev/null 2>&1; then
-  CODEX_THREAD_ID=mcp-bootstrap "$BROWSER_WRAPPER" >"$LOG_FILE" 2>&1 <<'PY'
-print(tab_pool_status())
-PY
-fi
-
-if ! /usr/bin/curl -fsS --max-time 2 "$CDP_URL/json/version" >/dev/null 2>&1; then
-  print -u2 "browser-use-isolated-mcp: dedicated Chrome is unavailable at $CDP_URL"
-  print -u2 "browser-use-isolated-mcp: inspect $LOG_FILE"
-  exit 1
-fi
+# Starting an MCP server must not start Chrome. The stdio guard launches the
+# isolated browser lazily immediately before the first browser tool call.
+export BROWSER_USE_ISOLATED_WRAPPER="$BROWSER_WRAPPER"
+export BROWSER_USE_ISOLATED_CDP_URL="$CDP_URL"
+export BROWSER_USE_ISOLATED_LOG_FILE="$LOG_FILE"
+export BROWSER_USE_ISOLATED_PROFILE_DIR="$PROFILE_DIR"
 
 exec /usr/bin/python3 "$MCP_GUARD" "$MCP_BIN" \
   "--browser-url=$CDP_URL" \
