@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import shlex
 import shutil
 import socket
 import subprocess
@@ -83,6 +84,7 @@ class Layout:
         self.wrapper = self.home / ".local/bin/browser-use-isolated"
         self.mcp_wrapper = self.home / ".local/bin/browser-use-isolated-mcp"
         self.mcp_guard = self.config_dir / "mcp-stdio-guard.py"
+        self.background_target_helper = self.config_dir / "background-target.py"
         self.mcp_root = self.home / ".local/share/browser-use-isolated-kit/mcp"
         self.mcp_bin = self.mcp_root / "node_modules/.bin/chrome-devtools-mcp"
         self.skill_file = Path(
@@ -110,11 +112,33 @@ class Layout:
         else:
             self.port = 9333
         self.pool_size = args.pool_size
+        self.browser_use_python = self._discover_browser_use_python()
         self.site_packages = (
             Path(args.site_packages).expanduser()
             if args.site_packages
             else self._discover_site_packages()
         )
+
+    def _discover_browser_use_python(self) -> Optional[Path]:
+        resolved = self.browser_use_bin.resolve(strict=False)
+        if not resolved.exists():
+            return None
+        try:
+            with resolved.open(encoding="utf-8") as executable:
+                first_line = executable.readline().strip()
+        except (OSError, UnicodeDecodeError):
+            return None
+        if not first_line.startswith("#!"):
+            return None
+        parts = shlex.split(first_line[2:])
+        if not parts:
+            return None
+        if Path(parts[0]).name == "env":
+            if len(parts) < 2:
+                return None
+            discovered = shutil.which(parts[1])
+            return Path(discovered) if discovered else None
+        return Path(parts[0])
 
     def _discover_site_packages(self) -> Optional[Path]:
         resolved = self.browser_use_bin.resolve(strict=False)
@@ -369,6 +393,8 @@ def render_wrapper(layout: Layout) -> str:
     )
     values = {
         "@@BROWSER_USE_BIN@@": str(layout.browser_use_bin),
+        "@@BROWSER_USE_PYTHON@@": str(layout.browser_use_python),
+        "@@BACKGROUND_TARGET_HELPER@@": str(layout.background_target_helper),
         "@@CHROME_APP@@": str(layout.chrome_app_path),
         "@@CHROME_BIN@@": str(layout.chrome_bin),
         "@@PROFILE_DIR@@": str(layout.profile_dir),
@@ -404,6 +430,12 @@ def render_mcp_wrapper(layout: Layout) -> str:
 
 def render_mcp_guard() -> str:
     return (REPO_ROOT / "templates/mcp-stdio-guard.py").read_text(
+        encoding="utf-8"
+    )
+
+
+def render_background_target_helper() -> str:
+    return (REPO_ROOT / "templates/background-target.py").read_text(
         encoding="utf-8"
     )
 
@@ -636,9 +668,10 @@ def install(args: argparse.Namespace) -> int:
     missing = []
     for path, label in (
         (layout.browser_use_bin, "browser-use"),
+        (layout.browser_use_python, "browser-use Python"),
         (layout.chrome_bin, "Google Chrome"),
     ):
-        if not path.exists():
+        if path is None or not path.exists():
             missing.append(f"{label}: {path}")
     for command in ("curl", "jq", "lsof", "zsh"):
         if shutil.which(command) is None:
@@ -670,6 +703,11 @@ def install(args: argparse.Namespace) -> int:
     layout.profile_dir.mkdir(parents=True, exist_ok=True)
     (layout.workspace / "tab-pool").mkdir(parents=True, exist_ok=True)
     write_atomic(layout.wrapper, render_wrapper(layout), 0o755)
+    write_atomic(
+        layout.background_target_helper,
+        render_background_target_helper(),
+        0o755,
+    )
     # A kit-only update must refresh the managed focus guard without requiring
     # an npm reinstall or changing the device's pinned MCP version.
     if layout.mcp_wrapper.exists():
@@ -722,6 +760,11 @@ def doctor(args: argparse.Namespace) -> int:
         ("browser-use", layout.browser_use_bin.exists(), str(layout.browser_use_bin)),
         ("chrome", layout.chrome_bin.exists(), str(layout.chrome_bin)),
         ("wrapper", layout.wrapper.exists(), str(layout.wrapper)),
+        (
+            "background_target_helper",
+            layout.background_target_helper.exists(),
+            str(layout.background_target_helper),
+        ),
         (
             "agent_helpers",
             (layout.workspace / "agent_helpers.py").exists(),
@@ -868,6 +911,7 @@ def uninstall(args: argparse.Namespace) -> int:
             print(f"Preserved changed package file: {path}", file=sys.stderr)
     for path in (
         layout.wrapper,
+        layout.background_target_helper,
         layout.workspace / "agent_helpers.py",
         layout.config_path,
         layout.state_path,

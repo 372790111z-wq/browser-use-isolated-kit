@@ -2,6 +2,8 @@
 set -euo pipefail
 
 readonly BROWSER_USE_BIN="@@BROWSER_USE_BIN@@"
+readonly BROWSER_USE_PYTHON="@@BROWSER_USE_PYTHON@@"
+readonly BACKGROUND_TARGET_HELPER="@@BACKGROUND_TARGET_HELPER@@"
 readonly CHROME_APP="@@CHROME_APP@@"
 readonly CHROME_BIN="@@CHROME_BIN@@"
 readonly PROFILE_DIR="@@PROFILE_DIR@@"
@@ -22,6 +24,11 @@ readonly DAEMON_GENERATION_FILE="$AGENT_WORKSPACE/tab-pool/daemon-$thread_id.gen
 
 if [[ ! -x "$BROWSER_USE_BIN" ]]; then
   print -u2 "browser-use-isolated: browser-use is not installed at $BROWSER_USE_BIN"
+  exit 1
+fi
+
+if [[ ! -x "$BROWSER_USE_PYTHON" || ! -f "$BACKGROUND_TARGET_HELPER" ]]; then
+  print -u2 "browser-use-isolated: background target helper is unavailable"
   exit 1
 fi
 
@@ -125,9 +132,9 @@ restore_frontmost_pid() {
     "$pid" >/dev/null 2>&1 || true
 }
 
-# Capture focus before LaunchServices has any chance to activate the isolated
-# Chrome. A cold start restores this application after Chrome and its one
-# required bootstrap target are ready.
+# Capture focus before the isolated Chrome process starts. The background CDP
+# path should preserve focus by itself; this remains a one-shot fallback for
+# Chrome versions that briefly activate during initialization.
 readonly ORIGINAL_FRONTMOST_PID="$(frontmost_pid)"
 
 bootstrap_pool() {
@@ -234,14 +241,13 @@ if ! cdp_is_ours; then
     exit 1
   fi
   started_chrome=1
-  typeset -a pool_urls
-  typeset slot
-  for (( slot=1; slot<=INITIAL_TABS; slot++ )); do
-    pool_urls+=("data:text/html,BU_POOL_$(printf '%02d' "$slot")")
-  done
   # Launch the executable directly, as recommended by Chromium for a custom
   # user-data-dir. Going through `open -na` registers another same-bundle
   # LaunchServices instance and can misroute ordinary links into automation.
+  # Do not create the bootstrap window in Chrome's command line: Chrome 151 can
+  # activate that window again after a one-shot focus restoration. Start only
+  # the browser process, then create its required first page through raw CDP
+  # with background=true.
   "$CHROME_BIN" \
     --user-data-dir="$PROFILE_DIR" \
     --remote-debugging-port="$CDP_PORT" \
@@ -250,20 +256,38 @@ if ! cdp_is_ours; then
     --disable-renderer-backgrounding \
     --no-first-run \
     --no-default-browser-check \
-    "${pool_urls[@]}" \
+    --no-startup-window \
     >"$AGENT_WORKSPACE/tab-pool/chrome.log" 2>&1 &!
 
   for attempt in {1..50}; do
-    if cdp_is_ours \
-        && has_page_target; then
+    if cdp_is_ours; then
       break
     fi
     /bin/sleep 0.2
+  done
+  if cdp_is_ours; then
+    if ! "$BROWSER_USE_PYTHON" "$BACKGROUND_TARGET_HELPER" \
+        "$CDP_URL" "data:text/html,BU_POOL_01" >/dev/null; then
+      restore_frontmost_pid "$ORIGINAL_FRONTMOST_PID"
+      terminate_isolated_chrome
+      print -u2 "browser-use-isolated: failed to create the background bootstrap target"
+      exit 1
+    fi
+  fi
+  for attempt in {1..30}; do
+    if has_page_target; then
+      break
+    fi
+    /bin/sleep 0.1
   done
 fi
 
 if ! cdp_is_ours \
     || ! has_page_target; then
+  if [[ "$started_chrome" -eq 1 ]]; then
+    restore_frontmost_pid "$ORIGINAL_FRONTMOST_PID"
+    terminate_isolated_chrome
+  fi
   print -u2 "browser-use-isolated: Chrome did not expose a page target at $CDP_URL"
   exit 1
 fi

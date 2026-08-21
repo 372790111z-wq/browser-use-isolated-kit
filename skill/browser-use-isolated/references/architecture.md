@@ -21,9 +21,10 @@ The repository maintains four layers:
    Tabs are created on demand. The default soft threshold is 12 and the default
    safety limit is 24; capacity cleanup archives only completed or abandoned
    work and never steals a live lease.
-   Chrome starts with one disposable bootstrap target because CDP requires a
-   page target; this is not a preallocated work-tab pool. Work pages are still
-   created on demand.
+   Chrome starts with `--no-startup-window`; after the browser-level CDP
+   endpoint is ready, a managed helper creates one disposable bootstrap target
+   with `background=true`. This avoids a visible cold-start window and is not a
+   preallocated work-tab pool. Work pages are still created on demand.
 3. Version-checked upstream patches prevent normal CDP tab selection from
    activating Chrome on macOS.
 4. A marked policy block in the official Browser Use Skill forces local tasks
