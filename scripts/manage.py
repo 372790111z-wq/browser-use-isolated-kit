@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import shlex
 import shutil
 import socket
 import subprocess
@@ -20,6 +21,9 @@ from typing import Optional
 REPO_ROOT = Path(__file__).resolve().parents[1]
 POLICY_START = "<!-- browser-use-isolated-kit:policy:start -->"
 POLICY_END = "<!-- browser-use-isolated-kit:policy:end -->"
+MCP_NAME = "browser-use-isolated"
+MCP_PACKAGE = "chrome-devtools-mcp"
+MCP_VERSION = "1.6.0"
 
 
 def sha256(path: Path) -> str:
@@ -78,6 +82,11 @@ class Layout:
         self.state_path = self.config_dir / "install-state.json"
         self.backup_dir = self.config_dir / "backups"
         self.wrapper = self.home / ".local/bin/browser-use-isolated"
+        self.mcp_wrapper = self.home / ".local/bin/browser-use-isolated-mcp"
+        self.mcp_guard = self.config_dir / "mcp-stdio-guard.py"
+        self.background_target_helper = self.config_dir / "background-target.py"
+        self.mcp_root = self.home / ".local/share/browser-use-isolated-kit/mcp"
+        self.mcp_bin = self.mcp_root / "node_modules/.bin/chrome-devtools-mcp"
         self.skill_file = Path(
             args.skill_file
             or self.home / ".codex/skills/browser-use/SKILL.md"
@@ -91,6 +100,8 @@ class Layout:
                 )
             except (json.JSONDecodeError, OSError):
                 saved_config = {}
+        self.saved_config = saved_config
+        self.mcp_version = str(saved_config.get("mcp_version") or MCP_VERSION)
         saved_port = saved_config.get("cdp_port")
         if args.port is not None:
             self.port = args.port
@@ -101,11 +112,33 @@ class Layout:
         else:
             self.port = 9333
         self.pool_size = args.pool_size
+        self.browser_use_python = self._discover_browser_use_python()
         self.site_packages = (
             Path(args.site_packages).expanduser()
             if args.site_packages
             else self._discover_site_packages()
         )
+
+    def _discover_browser_use_python(self) -> Optional[Path]:
+        resolved = self.browser_use_bin.resolve(strict=False)
+        if not resolved.exists():
+            return None
+        try:
+            with resolved.open(encoding="utf-8") as executable:
+                first_line = executable.readline().strip()
+        except (OSError, UnicodeDecodeError):
+            return None
+        if not first_line.startswith("#!"):
+            return None
+        parts = shlex.split(first_line[2:])
+        if not parts:
+            return None
+        if Path(parts[0]).name == "env":
+            if len(parts) < 2:
+                return None
+            discovered = shutil.which(parts[1])
+            return Path(discovered) if discovered else None
+        return Path(parts[0])
 
     def _discover_site_packages(self) -> Optional[Path]:
         resolved = self.browser_use_bin.resolve(strict=False)
@@ -140,9 +173,12 @@ def policy_block(layout: Layout) -> str:
     return f"""{POLICY_START}
 ## Device-local isolated browser policy
 
-For local browser work on this Mac, always invoke `browser-use-isolated`.
+For normal local browser work on this Mac, use the MCP server
+`browser-use-isolated`. The CLI wrapper is reserved for installation,
+diagnosis, repair, and direct compatibility fallback after explicit approval.
 
 - Wrapper: `{layout.wrapper}`
+- MCP wrapper: `{layout.mcp_wrapper}`
 - Dedicated profile: `{layout.profile_dir}`
 - Dedicated CDP: `http://127.0.0.1:{layout.port}`
 - Per-thread daemon: `codex-isolated-$CODEX_THREAD_ID`
@@ -151,6 +187,8 @@ For local browser work on this Mac, always invoke `browser-use-isolated`.
 - All sessions may list isolated tabs. A completed, idle, or abandoned tab may
   be taken over; an actively leased tab must never be stolen.
 - Never auto-discover or fall back to the user's everyday Chrome.
+- Do not run `/bin/ps` or connect to the CDP endpoint from the task shell when
+  the MCP server is available.
 - The isolation boundary is the installed Google Chrome application plus a
   separate profile, process, CDP endpoint, and observable tab pool. A second
   Chrome application is not required.
@@ -160,9 +198,10 @@ and distinguish application-path, CDP, permission, tab-pool, and daemon
 problems. If isolation cannot be restored safely, stop and report the blocker.
 Shared Chrome requires an explicit user request.
 
-Use `new_tab(url)` for the first page. At normal completion call
-`complete_thread_tabs()` so results remain visible and safely reclaimable. Use
-`show_tab()` only when the user explicitly asks to see the controlled page.
+With MCP, create a new background page for each independent task. Do not select
+an existing page unless the user asks to continue it. Use the direct helper
+functions only during approved compatibility fallback; then call
+`complete_thread_tabs()` at normal completion.
 {POLICY_END}"""
 
 
@@ -354,6 +393,8 @@ def render_wrapper(layout: Layout) -> str:
     )
     values = {
         "@@BROWSER_USE_BIN@@": str(layout.browser_use_bin),
+        "@@BROWSER_USE_PYTHON@@": str(layout.browser_use_python),
+        "@@BACKGROUND_TARGET_HELPER@@": str(layout.background_target_helper),
         "@@CHROME_APP@@": str(layout.chrome_app_path),
         "@@CHROME_BIN@@": str(layout.chrome_bin),
         "@@PROFILE_DIR@@": str(layout.profile_dir),
@@ -366,6 +407,247 @@ def render_wrapper(layout: Layout) -> str:
     if "@@" in template:
         raise RuntimeError("Unresolved wrapper template token")
     return template
+
+
+def render_mcp_wrapper(layout: Layout) -> str:
+    template = (REPO_ROOT / "templates/browser-use-isolated-mcp.zsh").read_text(
+        encoding="utf-8"
+    )
+    values = {
+        "@@BROWSER_WRAPPER@@": str(layout.wrapper),
+        "@@MCP_BIN@@": str(layout.mcp_bin),
+        "@@MCP_GUARD@@": str(layout.mcp_guard),
+        "@@CDP_PORT@@": str(layout.port),
+        "@@PROFILE_DIR@@": str(layout.profile_dir),
+        "@@LOG_DIR@@": str(layout.config_dir / "logs"),
+    }
+    for token, value in values.items():
+        template = template.replace(token, value)
+    if "@@" in template:
+        raise RuntimeError("Unresolved MCP wrapper template token")
+    return template
+
+
+def render_mcp_guard() -> str:
+    return (REPO_ROOT / "templates/mcp-stdio-guard.py").read_text(
+        encoding="utf-8"
+    )
+
+
+def render_background_target_helper() -> str:
+    return (REPO_ROOT / "templates/background-target.py").read_text(
+        encoding="utf-8"
+    )
+
+
+def configured_mcp(layout: Layout, codex_bin: str) -> tuple[bool, str]:
+    result = run([codex_bin, "mcp", "get", MCP_NAME], check=False)
+    if result.returncode:
+        return False, "not configured"
+    combined = result.stdout + result.stderr
+    if str(layout.mcp_wrapper) not in combined:
+        return False, "name exists but is not managed by this kit"
+    return True, str(layout.mcp_wrapper)
+
+
+def npm_latest_mcp_version(npm_bin: str) -> str:
+    result = run([npm_bin, "view", MCP_PACKAGE, "version"])
+    version = result.stdout.strip()
+    if not version:
+        raise RuntimeError("npm returned an empty Chrome DevTools MCP version")
+    return version
+
+
+def mcp_binary_version(binary: Path) -> str:
+    if not binary.exists():
+        return "not-installed"
+    result = run([str(binary), "--version"], check=False)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or f"Could not run {binary}")
+    return result.stdout.strip().splitlines()[-1]
+
+
+def validate_mcp_install(root: Path, expected_version: str) -> Path:
+    binary = root / "node_modules/.bin/chrome-devtools-mcp"
+    actual = mcp_binary_version(binary)
+    if actual != expected_version:
+        raise RuntimeError(
+            f"MCP version mismatch: expected {expected_version}, found {actual}"
+        )
+    help_result = run([str(binary), "--help"], check=False)
+    help_text = help_result.stdout + help_result.stderr
+    if help_result.returncode or "browserUrl" not in help_text:
+        raise RuntimeError("Candidate MCP does not support --browser-url")
+    if "usageStatistics" not in help_text:
+        raise RuntimeError("Candidate MCP does not support usage-statistics control")
+    return binary
+
+
+def persist_mcp_version(layout: Layout, version: str) -> None:
+    config = dict(layout.saved_config)
+    config["mcp_version"] = version
+    write_atomic(layout.config_path, json.dumps(config, indent=2) + "\n")
+
+
+def configure_mcp(args: argparse.Namespace) -> int:
+    layout = Layout(args)
+    npm_bin = args.npm_bin or shutil.which("npm")
+    codex_bin = args.codex_bin or shutil.which("codex")
+    if not layout.wrapper.exists():
+        raise RuntimeError("Install the isolated browser kit before configuring MCP")
+    if not npm_bin:
+        raise RuntimeError("npm is required for the official Chrome DevTools MCP")
+    if not codex_bin:
+        raise RuntimeError("Codex CLI was not found")
+
+    existing = run([codex_bin, "mcp", "get", MCP_NAME], check=False)
+    if existing.returncode == 0 and str(layout.mcp_wrapper) not in (
+        existing.stdout + existing.stderr
+    ):
+        raise RuntimeError(
+            f"MCP name {MCP_NAME!r} already exists and is not managed by this kit"
+        )
+
+    layout.mcp_root.mkdir(parents=True, exist_ok=True)
+    run(
+        [
+            npm_bin,
+            "install",
+            "--prefix",
+            str(layout.mcp_root),
+            "--omit=dev",
+            f"{MCP_PACKAGE}@{layout.mcp_version}",
+        ]
+    )
+    validate_mcp_install(layout.mcp_root, layout.mcp_version)
+    persist_mcp_version(layout, layout.mcp_version)
+    write_atomic(layout.mcp_guard, render_mcp_guard(), 0o755)
+    write_atomic(layout.mcp_wrapper, render_mcp_wrapper(layout), 0o755)
+
+    if existing.returncode != 0:
+        run([codex_bin, "mcp", "add", MCP_NAME, "--", str(layout.mcp_wrapper)])
+    ok, detail = configured_mcp(layout, codex_bin)
+    if not ok:
+        raise RuntimeError(f"Codex MCP configuration failed: {detail}")
+    print(f"Configured Codex MCP {MCP_NAME}: {layout.mcp_wrapper}")
+    print("Restart existing Codex sessions so the new MCP tools are loaded.")
+    return 0
+
+
+def check_mcp_update(args: argparse.Namespace) -> int:
+    layout = Layout(args)
+    npm_bin = args.npm_bin or shutil.which("npm")
+    if not npm_bin:
+        raise RuntimeError("npm is required to check Chrome DevTools MCP updates")
+    installed = mcp_binary_version(layout.mcp_bin)
+    latest = npm_latest_mcp_version(npm_bin)
+    print(f"project_default={MCP_VERSION}")
+    print(f"device_lock={layout.mcp_version}")
+    print(f"installed={installed}")
+    print(f"latest={latest}")
+    print("update_available=" + str(installed != latest).lower())
+    return 0
+
+
+def update_mcp(args: argparse.Namespace) -> int:
+    layout = Layout(args)
+    npm_bin = args.npm_bin or shutil.which("npm")
+    if not npm_bin:
+        raise RuntimeError("npm is required to update Chrome DevTools MCP")
+    target = args.to or npm_latest_mcp_version(npm_bin)
+    current = mcp_binary_version(layout.mcp_bin)
+    if current == target:
+        persist_mcp_version(layout, target)
+        print(f"Chrome DevTools MCP is already {target}")
+        return 0
+
+    candidate = layout.mcp_root.with_name("mcp.next")
+    backup = layout.mcp_root.with_name("mcp.previous")
+    if candidate.exists():
+        shutil.rmtree(candidate)
+    candidate.mkdir(parents=True)
+    try:
+        run(
+            [
+                npm_bin,
+                "install",
+                "--prefix",
+                str(candidate),
+                "--omit=dev",
+                f"{MCP_PACKAGE}@{target}",
+            ]
+        )
+        validate_mcp_install(candidate, target)
+        if backup.exists():
+            shutil.rmtree(backup)
+        if layout.mcp_root.exists():
+            layout.mcp_root.rename(backup)
+        candidate.rename(layout.mcp_root)
+        persist_mcp_version(layout, target)
+    except Exception:
+        if candidate.exists():
+            shutil.rmtree(candidate)
+        if not layout.mcp_root.exists() and backup.exists():
+            backup.rename(layout.mcp_root)
+        raise
+    print(f"Updated Chrome DevTools MCP: {current} -> {target}")
+    print(f"Rollback copy preserved at {backup}")
+    print("Restart existing Codex sessions to load the updated MCP process.")
+    return 0
+
+
+def rollback_mcp(args: argparse.Namespace) -> int:
+    if not args.yes:
+        raise RuntimeError("MCP rollback requires --yes")
+    layout = Layout(args)
+    backup = layout.mcp_root.with_name("mcp.previous")
+    if not backup.exists():
+        raise RuntimeError("No previous MCP installation is available")
+    previous = mcp_binary_version(backup / "node_modules/.bin/chrome-devtools-mcp")
+    current_dir = layout.mcp_root.with_name("mcp.rollback-current")
+    if current_dir.exists():
+        shutil.rmtree(current_dir)
+    if layout.mcp_root.exists():
+        layout.mcp_root.rename(current_dir)
+    try:
+        backup.rename(layout.mcp_root)
+        validate_mcp_install(layout.mcp_root, previous)
+        persist_mcp_version(layout, previous)
+    except Exception:
+        if layout.mcp_root.exists():
+            layout.mcp_root.rename(backup)
+        if current_dir.exists():
+            current_dir.rename(layout.mcp_root)
+        raise
+    current_dir.rename(backup)
+    print(f"Rolled back Chrome DevTools MCP to {previous}")
+    print("Restart existing Codex sessions to load the rolled-back MCP process.")
+    return 0
+
+
+def remove_mcp(args: argparse.Namespace) -> int:
+    if not args.yes:
+        raise RuntimeError("Removing the MCP entry requires --yes")
+    layout = Layout(args)
+    codex_bin = args.codex_bin or shutil.which("codex")
+    if not codex_bin:
+        raise RuntimeError("Codex CLI was not found")
+    existing = run([codex_bin, "mcp", "get", MCP_NAME], check=False)
+    if existing.returncode == 0:
+        combined = existing.stdout + existing.stderr
+        if str(layout.mcp_wrapper) not in combined:
+            raise RuntimeError(
+                f"Refusing to remove unmanaged MCP configuration {MCP_NAME!r}"
+            )
+        run([codex_bin, "mcp", "remove", MCP_NAME])
+    if layout.mcp_wrapper.exists():
+        layout.mcp_wrapper.unlink()
+    if layout.mcp_guard.exists():
+        layout.mcp_guard.unlink()
+    if layout.mcp_root.exists():
+        shutil.rmtree(layout.mcp_root)
+    print(f"Removed Codex MCP {MCP_NAME}; isolated Chrome profile preserved")
+    return 0
 
 
 def install(args: argparse.Namespace) -> int:
@@ -386,9 +668,10 @@ def install(args: argparse.Namespace) -> int:
     missing = []
     for path, label in (
         (layout.browser_use_bin, "browser-use"),
+        (layout.browser_use_python, "browser-use Python"),
         (layout.chrome_bin, "Google Chrome"),
     ):
-        if not path.exists():
+        if path is None or not path.exists():
             missing.append(f"{label}: {path}")
     for command in ("curl", "jq", "lsof", "zsh"):
         if shutil.which(command) is None:
@@ -420,6 +703,20 @@ def install(args: argparse.Namespace) -> int:
     layout.profile_dir.mkdir(parents=True, exist_ok=True)
     (layout.workspace / "tab-pool").mkdir(parents=True, exist_ok=True)
     write_atomic(layout.wrapper, render_wrapper(layout), 0o755)
+    write_atomic(
+        layout.background_target_helper,
+        render_background_target_helper(),
+        0o755,
+    )
+    # A kit-only update must refresh the managed focus guard without requiring
+    # an npm reinstall or changing the device's pinned MCP version.
+    if layout.mcp_wrapper.exists():
+        if not layout.mcp_bin.exists():
+            raise RuntimeError(
+                "Managed MCP wrapper exists but its pinned package is missing"
+            )
+        write_atomic(layout.mcp_guard, render_mcp_guard(), 0o755)
+        write_atomic(layout.mcp_wrapper, render_mcp_wrapper(layout), 0o755)
     shutil.copy2(
         REPO_ROOT / "templates/agent_helpers.py",
         layout.workspace / "agent_helpers.py",
@@ -445,6 +742,7 @@ def install(args: argparse.Namespace) -> int:
         "agent_workspace": str(layout.workspace),
         "cdp_port": layout.port,
         "pool_size": layout.pool_size,
+        "mcp_version": layout.mcp_version,
     }
     write_atomic(layout.config_path, json.dumps(config, indent=2) + "\n")
     write_atomic(layout.state_path, json.dumps(state, indent=2) + "\n")
@@ -462,6 +760,11 @@ def doctor(args: argparse.Namespace) -> int:
         ("browser-use", layout.browser_use_bin.exists(), str(layout.browser_use_bin)),
         ("chrome", layout.chrome_bin.exists(), str(layout.chrome_bin)),
         ("wrapper", layout.wrapper.exists(), str(layout.wrapper)),
+        (
+            "background_target_helper",
+            layout.background_target_helper.exists(),
+            str(layout.background_target_helper),
+        ),
         (
             "agent_helpers",
             (layout.workspace / "agent_helpers.py").exists(),
@@ -486,6 +789,21 @@ def doctor(args: argparse.Namespace) -> int:
         ("background_patches", patches_ok, patches_detail),
         ("cdp_port_ownership", port_ok, port_detail),
     ]
+    if args.mcp:
+        codex_bin = args.codex_bin or shutil.which("codex")
+        mcp_ok, mcp_detail = (
+            configured_mcp(layout, codex_bin)
+            if codex_bin
+            else (False, "Codex CLI not found")
+        )
+        checks.extend(
+            [
+                ("mcp_wrapper", layout.mcp_wrapper.exists(), str(layout.mcp_wrapper)),
+                ("mcp_guard", layout.mcp_guard.exists(), str(layout.mcp_guard)),
+                ("mcp_package", layout.mcp_bin.exists(), str(layout.mcp_bin)),
+                ("codex_mcp", mcp_ok, mcp_detail),
+            ]
+        )
     failed = False
     for name, ok, detail in checks:
         print(f"{'PASS' if ok else 'FAIL'} {name}: {detail}")
@@ -593,6 +911,7 @@ def uninstall(args: argparse.Namespace) -> int:
             print(f"Preserved changed package file: {path}", file=sys.stderr)
     for path in (
         layout.wrapper,
+        layout.background_target_helper,
         layout.workspace / "agent_helpers.py",
         layout.config_path,
         layout.state_path,
@@ -622,17 +941,28 @@ def parser() -> argparse.ArgumentParser:
     common.add_argument("--port", type=int)
     common.add_argument("--pool-size", type=int, default=12)
     common.add_argument("--allow-non-macos", action="store_true")
+    common.add_argument("--npm-bin")
+    common.add_argument("--codex-bin")
 
     root = argparse.ArgumentParser(description=__doc__)
     sub = root.add_subparsers(dest="command", required=True)
     sub.add_parser("install", parents=[common])
     doctor_parser = sub.add_parser("doctor", parents=[common])
     doctor_parser.add_argument("--live", action="store_true")
+    doctor_parser.add_argument("--mcp", action="store_true")
     update_parser = sub.add_parser("update", parents=[common])
     update_parser.add_argument("--upstream", action="store_true")
     uninstall_parser = sub.add_parser("uninstall", parents=[common])
     uninstall_parser.add_argument("--yes", action="store_true")
     uninstall_parser.add_argument("--remove-profile", action="store_true")
+    sub.add_parser("configure-mcp", parents=[common])
+    sub.add_parser("check-mcp-update", parents=[common])
+    update_mcp_parser = sub.add_parser("update-mcp", parents=[common])
+    update_mcp_parser.add_argument("--to")
+    rollback_mcp_parser = sub.add_parser("rollback-mcp", parents=[common])
+    rollback_mcp_parser.add_argument("--yes", action="store_true")
+    remove_mcp_parser = sub.add_parser("remove-mcp", parents=[common])
+    remove_mcp_parser.add_argument("--yes", action="store_true")
     return root
 
 
@@ -644,6 +974,11 @@ def main() -> int:
             "doctor": doctor,
             "update": update,
             "uninstall": uninstall,
+            "configure-mcp": configure_mcp,
+            "check-mcp-update": check_mcp_update,
+            "update-mcp": update_mcp,
+            "rollback-mcp": rollback_mcp,
+            "remove-mcp": remove_mcp,
         }[args.command](args)
     except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

@@ -8,6 +8,8 @@ The kit installs:
 - a dedicated Chrome profile and CDP endpoint;
 - a background-safe `browser-use-isolated` wrapper;
 - an observable shared tab workspace with per-task leases;
+- an optional host-managed Codex MCP entrypoint pinned to Chrome DevTools MCP
+  `1.6.0`;
 - on-demand tabs, a configurable soft threshold, and safe automatic archival;
 - deterministic Browser Use compatibility patches;
 - an idempotent policy block in the installed Browser Use Skill;
@@ -65,6 +67,68 @@ print(page_info())
 complete_thread_tabs()
 PY
 ```
+
+## Configure Codex MCP
+
+This avoids task-shell `ps` and localhost permission differences by connecting
+the official Chrome DevTools MCP to the already-running dedicated Chrome:
+
+```bash
+python3 scripts/manage.py configure-mcp
+python3 scripts/manage.py doctor --mcp
+```
+
+The command installs the pinned npm package under
+`~/.local/share/browser-use-isolated-kit/mcp`, adds a separate
+`browser-use-isolated` MCP entry, and does not replace an existing
+`chrome-devtools` MCP configuration. Restart existing Codex sessions afterward.
+
+The MCP provides a host-managed permission path, but it does not enforce the
+Browser Use helper's per-thread leases. The installed policy therefore creates
+a new background page for each independent task and continues an existing page
+only when explicitly requested. Concurrent-session behavior must be validated
+after configuration rather than inferred from successful connection alone.
+The managed stdio guard overrides Chrome DevTools MCP's foreground defaults:
+new pages always open in the background, page selection never activates the
+Chrome window, and foreground display remains an explicit Browser Use action.
+Loading the MCP server does not start Chrome. The guard starts it under a host
+lock immediately before the first browser tool call, so ordinary Codex tasks
+do not leave a second Chrome instance registered for URL handling.
+
+To roll back only the MCP entry while preserving Browser Use and the Chrome
+profile:
+
+```bash
+python3 scripts/manage.py remove-mcp --yes
+```
+
+Prerequisite: Node.js `^20.19.0`, `^22.12.0`, or `>=23`, plus npm.
+
+## MCP lifecycle
+
+Check the npm registry without modifying the installation:
+
+```bash
+python3 scripts/manage.py check-mcp-update
+```
+
+Upgrade to the latest release, or to an explicitly selected version:
+
+```bash
+python3 scripts/manage.py update-mcp
+python3 scripts/manage.py update-mcp --to 1.7.0
+```
+
+The updater installs into a staging directory, checks the executable version
+and required `--browser-url`/usage-statistics options, then swaps it into place.
+The previous installation is preserved for one-step rollback:
+
+```bash
+python3 scripts/manage.py rollback-mcp --yes
+```
+
+The validated device version is persisted in local configuration, so a later
+`configure-mcp` does not silently downgrade it to the repository default.
 
 The first installation selects an unused local CDP port (starting at `9333`)
 and persists it. Later launches never silently change ports. Opening more

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -32,7 +34,10 @@ class ManageTests(unittest.TestCase):
         self.port = 59433
 
         self.browser_use.parent.mkdir(parents=True)
-        self.browser_use.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        self.browser_use.write_text(
+            f"#!{sys.executable}\nraise SystemExit(0)\n",
+            encoding="utf-8",
+        )
         self.browser_use.chmod(0o755)
         self.chrome.parent.mkdir(parents=True)
         self.chrome.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -82,8 +87,12 @@ class ManageTests(unittest.TestCase):
             self.home
             / ".config/browser-harness/agent-workspace-isolated/agent_helpers.py"
         )
+        background_helper = (
+            self.home / ".config/browser-use-isolated-kit/background-target.py"
+        )
         self.assertTrue(wrapper.exists())
         self.assertTrue(helper.exists())
+        self.assertTrue(background_helper.exists())
         self.assertIn(
             manage.POLICY_START,
             self.skill.read_text(encoding="utf-8"),
@@ -110,6 +119,7 @@ class ManageTests(unittest.TestCase):
         )
         self.assertEqual(removed.returncode, 0, removed.stderr)
         self.assertFalse(wrapper.exists())
+        self.assertFalse(background_helper.exists())
         self.assertNotIn(
             manage.POLICY_START,
             self.skill.read_text(encoding="utf-8"),
@@ -187,18 +197,245 @@ class ManageTests(unittest.TestCase):
             self.home
             / ".config/browser-harness/agent-workspace-isolated/agent_helpers.py"
         ).read_text(encoding="utf-8")
+        background_helper = (
+            self.home / ".config/browser-use-isolated-kit/background-target.py"
+        )
         self.assertIn("readonly INITIAL_TABS=1", wrapper)
+        self.assertIn('readonly ORIGINAL_FRONTMOST_PID="$(frontmost_pid)"', wrapper)
+        self.assertIn('restore_frontmost_pid "$ORIGINAL_FRONTMOST_PID"', wrapper)
+        self.assertIn('--no-startup-window', wrapper)
+        self.assertIn('"$BACKGROUND_TARGET_HELPER"', wrapper)
+        self.assertNotIn('"${pool_urls[@]}"', wrapper)
         self.assertIn(f'readonly CHROME_APP="{self.chrome.parent.parent.parent}"', wrapper)
+        self.assertNotIn('/usr/bin/open -g -na', wrapper)
+        self.assertNotIn('console.log(', wrapper)
+        self.assertIn('"$CHROME_BIN" \\', wrapper)
+        self.assertNotIn('--new-window', wrapper)
         self.assertIn("BU_TAB_POOL_HARD_LIMIT", wrapper)
         self.assertIn('def list_tabs():', helper)
         self.assertIn('Target.createTarget', helper)
         self.assertIn('actively leased by Codex thread', helper)
+        background_helper_content = background_helper.read_text(encoding="utf-8")
+        self.assertIn('"method": "Target.createTarget"', background_helper_content)
+        self.assertIn('"background": True', background_helper_content)
+        compiled = subprocess.run(
+            [sys.executable, "-m", "py_compile", str(background_helper)],
+            text=True,
+            capture_output=True,
+            env={
+                **os.environ,
+                "PYTHONPYCACHEPREFIX": str(self.root / "pycache"),
+            },
+        )
+        self.assertEqual(compiled.returncode, 0, compiled.stderr)
         syntax = subprocess.run(
             ["/bin/zsh", "-n", str(self.home / ".local/bin/browser-use-isolated")],
             text=True,
             capture_output=True,
         )
         self.assertEqual(syntax.returncode, 0, syntax.stderr)
+
+    def test_mcp_wrapper_is_pinned_and_targets_persisted_cdp(self):
+        installed = subprocess.run(
+            self.command("install"), text=True, capture_output=True
+        )
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        args = manage.parser().parse_args(
+            self.command(
+                "configure-mcp",
+                "--npm-bin",
+                "/fake/npm",
+                "--codex-bin",
+                "/fake/codex",
+            )[2:]
+        )
+        layout = manage.Layout(args)
+        configured = False
+
+        def fake_run(command, **kwargs):
+            nonlocal configured
+            if command[:2] == ["/fake/npm", "install"]:
+                layout.mcp_bin.parent.mkdir(parents=True)
+                layout.mcp_bin.write_text(
+                    "#!/bin/sh\n"
+                    "if [ \"$1\" = \"--version\" ]; then echo 1.6.0; "
+                    "else echo browserUrl usageStatistics; fi\n",
+                    encoding="utf-8",
+                )
+                layout.mcp_bin.chmod(0o755)
+                return subprocess.CompletedProcess(command, 0, "", "")
+            if command[:4] == ["/fake/codex", "mcp", "get", manage.MCP_NAME]:
+                if configured:
+                    return subprocess.CompletedProcess(
+                        command, 0, f"command: {layout.mcp_wrapper}\n", ""
+                    )
+                return subprocess.CompletedProcess(command, 1, "", "missing")
+            if command[:4] == ["/fake/codex", "mcp", "add", manage.MCP_NAME]:
+                configured = True
+                return subprocess.CompletedProcess(command, 0, "", "")
+            if command == [str(layout.mcp_bin), "--version"]:
+                return subprocess.CompletedProcess(command, 0, "1.6.0\n", "")
+            if command == [str(layout.mcp_bin), "--help"]:
+                return subprocess.CompletedProcess(
+                    command, 0, "browserUrl usageStatistics\n", ""
+                )
+            self.fail(f"unexpected command: {command}")
+
+        with mock.patch.object(manage, "run", side_effect=fake_run):
+            self.assertEqual(manage.configure_mcp(args), 0)
+
+        wrapper = layout.mcp_wrapper.read_text(encoding="utf-8")
+        guard = layout.mcp_guard.read_text(encoding="utf-8")
+        self.assertIn(f'readonly CDP_URL="http://127.0.0.1:{self.port}"', wrapper)
+        self.assertIn('"--browser-url=$CDP_URL"', wrapper)
+        self.assertIn(str(layout.mcp_bin), wrapper)
+        self.assertIn(str(layout.mcp_guard), wrapper)
+        self.assertIn('BROWSER_USE_ISOLATED_WRAPPER', wrapper)
+        self.assertIn('BROWSER_USE_ISOLATED_PROFILE_DIR', wrapper)
+        self.assertNotIn('CODEX_THREAD_ID=mcp-bootstrap', wrapper)
+        self.assertIn('arguments["background"] = True', guard)
+        self.assertIn('arguments["bringToFront"] = False', guard)
+        self.assertNotIn("@latest", wrapper)
+        self.assertEqual(manage.MCP_VERSION, "1.6.0")
+        syntax = subprocess.run(
+            ["/bin/zsh", "-n", str(layout.mcp_wrapper)],
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+
+        spec = importlib.util.spec_from_file_location("mcp_guard", layout.mcp_guard)
+        guard_module = importlib.util.module_from_spec(spec)
+        assert spec.loader
+        spec.loader.exec_module(guard_module)
+        new_page = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "new_page",
+                "arguments": {
+                    "url": "https://example.com",
+                    "background": False,
+                    "isolatedContext": "unsafe",
+                },
+            },
+        }
+        protected = json.loads(
+            guard_module.protect_request(
+                (json.dumps(new_page) + "\n").encode()
+            )
+        )
+        arguments = protected["params"]["arguments"]
+        self.assertIs(arguments["background"], True)
+        self.assertNotIn("isolatedContext", arguments)
+        initialize = {
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {},
+        }
+        self.assertFalse(
+            guard_module.request_needs_browser(
+                (json.dumps(initialize) + "\n").encode()
+            )
+        )
+        self.assertTrue(
+            guard_module.request_needs_browser(
+                (json.dumps(new_page) + "\n").encode()
+            )
+        )
+        source = io.BytesIO(
+            (json.dumps(initialize) + "\n" + json.dumps(new_page) + "\n").encode()
+        )
+        destination = io.BytesIO()
+        with mock.patch.object(
+            guard_module, "ensure_browser"
+        ) as ensure_browser, mock.patch.object(
+            guard_module, "remember_focus"
+        ) as remember_focus:
+            guard_module.relay(source, destination, protect=True)
+        ensure_browser.assert_called_once_with()
+        remember_focus.assert_called_once()
+
+        response = (json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}) + "\n").encode()
+        with mock.patch.object(
+            guard_module, "frontmost_pid", return_value=123
+        ), mock.patch.object(
+            guard_module, "restore_focus_if_isolated"
+        ) as restore, mock.patch.object(guard_module.time, "sleep"):
+            guard_module.remember_focus((json.dumps(new_page) + "\n").encode())
+            guard_module.restore_focus_for_response(response)
+        restore.assert_called_once_with(123)
+
+        select_page = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "select_page",
+                "arguments": {"pageId": 1, "bringToFront": True},
+            },
+        }
+        protected_select = json.loads(
+            guard_module.protect_request(
+                (json.dumps(select_page) + "\n").encode()
+            )
+        )
+        self.assertIs(
+            protected_select["params"]["arguments"]["bringToFront"], False
+        )
+
+    def test_mcp_update_stages_persists_and_rolls_back(self):
+        update_args = manage.parser().parse_args(
+            self.command(
+                "update-mcp", "--npm-bin", "/fake/npm", "--to", "1.7.0"
+            )[2:]
+        )
+        layout = manage.Layout(update_args)
+
+        def write_fake_binary(root, version):
+            binary = root / "node_modules/.bin/chrome-devtools-mcp"
+            binary.parent.mkdir(parents=True, exist_ok=True)
+            binary.write_text(
+                "#!/bin/sh\n"
+                f"if [ \"$1\" = \"--version\" ]; then echo {version}; "
+                "else echo browserUrl usageStatistics; fi\n",
+                encoding="utf-8",
+            )
+            binary.chmod(0o755)
+
+        write_fake_binary(layout.mcp_root, "1.6.0")
+        layout.config_dir.mkdir(parents=True)
+        layout.config_path.write_text(
+            '{"cdp_port": 59433, "mcp_version": "1.6.0"}\n',
+            encoding="utf-8",
+        )
+
+        def fake_run(command, **kwargs):
+            if command[:2] == ["/fake/npm", "install"]:
+                prefix = Path(command[command.index("--prefix") + 1])
+                version = command[-1].rsplit("@", 1)[-1]
+                write_fake_binary(prefix, version)
+                return subprocess.CompletedProcess(command, 0, "", "")
+            return subprocess.run(command, text=True, capture_output=True)
+
+        with mock.patch.object(manage, "run", side_effect=fake_run):
+            self.assertEqual(manage.update_mcp(update_args), 0)
+        updated_config = json.loads(layout.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(updated_config["mcp_version"], "1.7.0")
+        self.assertEqual(manage.mcp_binary_version(layout.mcp_bin), "1.7.0")
+        self.assertTrue(layout.mcp_root.with_name("mcp.previous").exists())
+
+        rollback_args = manage.parser().parse_args(
+            self.command("rollback-mcp", "--yes")[2:]
+        )
+        self.assertEqual(manage.rollback_mcp(rollback_args), 0)
+        rolled_back_config = json.loads(
+            layout.config_path.read_text(encoding="utf-8")
+        )
+        self.assertEqual(rolled_back_config["mcp_version"], "1.6.0")
+        self.assertEqual(manage.mcp_binary_version(layout.mcp_bin), "1.6.0")
 
 
 if __name__ == "__main__":

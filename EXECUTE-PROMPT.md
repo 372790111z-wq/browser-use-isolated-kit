@@ -21,6 +21,9 @@ https://github.com/372790111z-wq/browser-use-isolated-kit
 11. 首次安装自动选择并持久化一个空闲 CDP 端口；后续不得按会话或按 AI 临时换端口。
 12. 页面按需创建。所有会话可查看隔离页面清单，但只能接管已完成、空闲或租约失效的页面，不得抢占正在运行的页面。
 13. 12 个页面是默认软阈值，24 个是默认安全上限；达到上限时只能自动归档并复用已完成或失去租约的页面。
+14. 为 Codex 执行 `python3 scripts/manage.py configure-mcp`，使用固定版本的官方 Chrome DevTools MCP 连接已存在的隔离 Chrome；不得使用 `@latest`，不得覆盖已有的 `chrome-devtools` MCP。
+15. 配置后运行 `python3 scripts/manage.py doctor --mcp`。说明旧会话需要重启，新会话才会加载新工具。
+16. 后续版本检查使用 `python3 scripts/manage.py check-mcp-update`；升级只能使用 `update-mcp`，失败时使用 `rollback-mcp --yes`，不得把配置改回 `@latest`。
 
 最终报告必须包含：
 
